@@ -14,7 +14,9 @@ fn main() {
         Some(Cmd::Add { alias, host, path }) => {
             let mut servers = load_servers();
             if servers.contains_key(&alias) {
-                eprintln!("Server '{alias}' already exists. Use 'snd edit {alias} <host> [path]' to modify.");
+                eprintln!(
+                    "Server '{alias}' already exists. Use 'snd edit {alias} <host> [path]' to modify."
+                );
                 std::process::exit(1);
             }
             let path = path.replace("\\~", "~");
@@ -51,8 +53,8 @@ fn main() {
                 return;
             }
             let max_len = servers.keys().map(|k| k.len()).max().unwrap_or(10).max(5);
-            println!("{:<max_len$}  {}", "ALIAS", "TARGET");
-            println!("{:<max_len$}  {}", "-----", "------");
+            println!("{:<max_len$}  TARGET", "ALIAS");
+            println!("{:<max_len$}  ------", "-----");
             for (alias, target) in &servers {
                 println!("{alias:<max_len$}  {target}");
             }

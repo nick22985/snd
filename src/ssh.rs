@@ -103,8 +103,8 @@ fn flush_host(
 }
 
 fn resolve_include(pattern: &str, home: &Path) -> Vec<PathBuf> {
-    let expanded = if pattern.starts_with("~/") {
-        home.join(&pattern[2..]).to_string_lossy().into_owned()
+    let expanded = if let Some(rest) = pattern.strip_prefix("~/") {
+        home.join(rest).to_string_lossy().into_owned()
     } else if pattern.starts_with('/') {
         pattern.to_string()
     } else {

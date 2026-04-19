@@ -3,8 +3,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use clap_complete::Shell;
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 
 use crate::config::load_servers;
 use crate::ssh::parse_ssh_hosts;
