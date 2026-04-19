@@ -81,8 +81,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version-bump.outputs.tag }}
-          fetch-depth: 0
+          ref: master
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -120,8 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version-bump.outputs.tag }}
-          fetch-depth: 0
+          ref: master
 
       - uses: actions/download-artifact@v4
         with:
