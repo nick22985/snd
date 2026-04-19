@@ -1,0 +1,12 @@
+[package]
+name = "snd"
+version = "0.1.0"
+edition = "2024"
+description = "Quick scp to configured servers"
+authors = ["nick22985"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
+dirs = "6"
+glob = "0.3.3"
