@@ -4,7 +4,7 @@ use std::io;
 use std::process::Command;
 
 use snd::cli::{Cli, Cmd};
-use snd::config::{load_servers, save_servers, Server};
+use snd::config::{Server, load_servers, save_servers};
 
 fn main() {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();

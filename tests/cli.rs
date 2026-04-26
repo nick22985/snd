@@ -236,7 +236,10 @@ fn edit_path_preserves_default_marker() {
     env.run(&["add-path", "web", "logs", "/var/log"]);
     env.run(&["edit-path", "web", "default", "/srv/www"]);
     let list = stdout(&env.run(&["list"]));
-    assert!(list.contains("* default"), "default marker preserved: {list}");
+    assert!(
+        list.contains("* default"),
+        "default marker preserved: {list}"
+    );
     assert!(list.contains("/srv/www"));
 }
 
@@ -429,7 +432,14 @@ fn completion_path_alias_for_set_default() {
 fn completion_server_for_subcommands() {
     let env = TestEnv::new();
     env.run(&["add", "web", "u@h", "/var/www"]);
-    for sub in ["remove", "edit", "add-path", "edit-path", "remove-path", "set-default"] {
+    for sub in [
+        "remove",
+        "edit",
+        "add-path",
+        "edit-path",
+        "remove-path",
+        "set-default",
+    ] {
         let out = env.run_complete(&[sub, ""]);
         assert!(out.contains("web"), "{sub}: {out}");
     }
