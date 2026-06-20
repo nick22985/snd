@@ -27,6 +27,13 @@ pub fn parse_ssh_hosts() -> Vec<SshHost> {
     hosts
 }
 
+pub fn lookup_alias(host: &str) -> Option<SshHost> {
+    if host.contains('@') || host.contains(':') {
+        return None;
+    }
+    parse_ssh_hosts().into_iter().find(|h| h.alias == host)
+}
+
 fn parse_ssh_config(path: &Path, home: &Path, hosts: &mut Vec<SshHost>) {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,

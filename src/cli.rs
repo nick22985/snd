@@ -2,10 +2,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use clap_complete::Shell;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
+use clap_complete::Shell;
 
-use crate::config::load_servers;
+use crate::config::{load_config, load_servers};
 use crate::ssh::parse_ssh_hosts;
 
 fn fuzzy_match(pattern: &str, target: &str) -> bool {
@@ -39,6 +39,160 @@ fn complete_server_alias(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> 
             CompletionCandidate::new(&alias).help(Some(clap::builder::StyledStr::from(help)))
         })
         .collect()
+}
+
+fn complete_group_alias(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current = current.to_str().unwrap_or("");
+    let cfg = load_config();
+    cfg.groups
+        .into_iter()
+        .filter(|(name, _)| current.is_empty() || fuzzy_match(current, name))
+        .map(|(name, g)| {
+            let help = format!("{} servers", g.targets.len());
+            CompletionCandidate::new(&name).help(Some(clap::builder::StyledStr::from(help)))
+        })
+        .collect()
+}
+
+fn complete_server_or_group(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current_str = current.to_str().unwrap_or("");
+    let cfg = load_config();
+    let mut out: Vec<CompletionCandidate> = Vec::new();
+    for (name, g) in &cfg.groups {
+        if !current_str.is_empty() && !fuzzy_match(current_str, name) {
+            continue;
+        }
+        out.push(
+            CompletionCandidate::new(name).help(Some(clap::builder::StyledStr::from(format!(
+                "group ({} servers)",
+                g.targets.len()
+            )))),
+        );
+    }
+    for (alias, srv) in &cfg.servers {
+        if !current_str.is_empty()
+            && !fuzzy_match(current_str, alias)
+            && !fuzzy_match(current_str, &srv.host)
+        {
+            continue;
+        }
+        let default = srv.default_target().unwrap_or_else(|| srv.host.clone());
+        out.push(
+            CompletionCandidate::new(alias).help(Some(clap::builder::StyledStr::from(default))),
+        );
+    }
+    let mut path_alias_owners: std::collections::BTreeMap<&str, Vec<(&String, &String)>> =
+        std::collections::BTreeMap::new();
+    for (alias, srv) in &cfg.servers {
+        for (path_alias, path) in &srv.paths {
+            path_alias_owners
+                .entry(path_alias.as_str())
+                .or_default()
+                .push((alias, path));
+        }
+    }
+    for (path_alias, owners) in path_alias_owners {
+        if owners.len() != 1 {
+            continue;
+        }
+        if cfg.servers.contains_key(path_alias) || cfg.groups.contains_key(path_alias) {
+            continue;
+        }
+        if !current_str.is_empty() && !fuzzy_match(current_str, path_alias) {
+            continue;
+        }
+        let (server, path) = owners[0];
+        let help = format!("{server} {path_alias} → {path}");
+        out.push(
+            CompletionCandidate::new(path_alias).help(Some(clap::builder::StyledStr::from(help))),
+        );
+    }
+    out
+}
+
+fn complete_group_member(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current_str = current.to_str().unwrap_or("");
+    let cfg = load_config();
+    let mut out: Vec<CompletionCandidate> = Vec::new();
+
+    for (alias, srv) in &cfg.servers {
+        if !current_str.is_empty()
+            && !fuzzy_match(current_str, alias)
+            && !fuzzy_match(current_str, &srv.host)
+        {
+            continue;
+        }
+        let default = srv.default_target().unwrap_or_else(|| srv.host.clone());
+        out.push(
+            CompletionCandidate::new(alias).help(Some(clap::builder::StyledStr::from(default))),
+        );
+    }
+
+    let mut path_alias_owners: std::collections::BTreeMap<&str, Vec<(&String, &String)>> =
+        std::collections::BTreeMap::new();
+    for (alias, srv) in &cfg.servers {
+        for (path_alias, path) in &srv.paths {
+            path_alias_owners
+                .entry(path_alias.as_str())
+                .or_default()
+                .push((alias, path));
+        }
+    }
+    for (path_alias, owners) in path_alias_owners {
+        let unique = owners.len() == 1 && !cfg.servers.contains_key(path_alias);
+        if unique {
+            if !current_str.is_empty() && !fuzzy_match(current_str, path_alias) {
+                continue;
+            }
+            let (server, path) = owners[0];
+            let help = format!("{server}:{path_alias} → {path}");
+            out.push(
+                CompletionCandidate::new(path_alias)
+                    .help(Some(clap::builder::StyledStr::from(help))),
+            );
+        } else {
+            for (server, path) in owners {
+                let qualified = format!("{server}:{path_alias}");
+                if !current_str.is_empty() && !fuzzy_match(current_str, &qualified) {
+                    continue;
+                }
+                out.push(
+                    CompletionCandidate::new(&qualified)
+                        .help(Some(clap::builder::StyledStr::from((*path).clone()))),
+                );
+            }
+        }
+    }
+    out
+}
+
+fn complete_existing_group_member(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current_str = current.to_str().unwrap_or("");
+    let Some(group) = extract_group_arg() else {
+        return Vec::new();
+    };
+    let cfg = load_config();
+    let Some(g) = cfg.groups.get(&group) else {
+        return Vec::new();
+    };
+    g.targets
+        .iter()
+        .filter(|t| current_str.is_empty() || fuzzy_match(current_str, t))
+        .map(|t| CompletionCandidate::new(t.as_str()))
+        .collect()
+}
+
+fn extract_group_arg() -> Option<String> {
+    let words = subcommand_words();
+    for (i, w) in words.iter().enumerate() {
+        match w.as_str() {
+            "remove-from-group" | "add-to-group" if i + 1 < words.len() => {
+                return Some(words[i + 1].clone());
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn complete_path_alias(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -213,6 +367,20 @@ fn extract_main_server_arg() -> Option<String> {
         "ls",
         "completions",
         "help",
+        "delete",
+        "del",
+        "rm-remote",
+        "get",
+        "pull",
+        "fetch",
+        "add-group",
+        "remove-group",
+        "rm-group",
+        "add-to-group",
+        "remove-from-group",
+        "rm-from-group",
+        "doctor",
+        "refresh",
     ];
     if SUBCOMMANDS.contains(&first.as_str()) {
         return None;
@@ -321,10 +489,10 @@ fn complete_main_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidat
     let mut candidates = Vec::new();
 
     if main_arg_position() == Some(0)
-        && let Some(server) = extract_main_server_arg()
+        && let Some(name) = extract_main_server_arg()
     {
-        let servers = load_servers();
-        if let Some(srv) = servers.get(&server) {
+        let cfg = load_config();
+        if let Some(srv) = cfg.servers.get(&name) {
             for (k, v) in &srv.paths {
                 if !partial.is_empty() && !fuzzy_match(partial, k) {
                     continue;
@@ -350,24 +518,33 @@ fn complete_remote_path(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
     let raw_current = current.to_str().unwrap_or("");
+    remote_path_candidates(&host, None, raw_current)
+}
+
+fn remote_path_candidates(
+    host: &str,
+    base: Option<&str>,
+    raw_current: &str,
+) -> Vec<CompletionCandidate> {
     let current = raw_current.replace("\\~", "~");
     let current = current.as_str();
-    let ls_dir = if current.is_empty() {
-        "~".to_string()
+    let dir_part = if current.is_empty() {
+        String::new()
     } else if current.ends_with('/') {
         current.trim_end_matches('/').to_string()
     } else {
-        current
-            .rsplit_once('/')
-            .map(|(p, _)| p.to_string())
-            .unwrap_or("~".to_string())
+        match current.rsplit_once('/') {
+            Some((d, _)) => d.to_string(),
+            None => String::new(),
+        }
     };
+    let ls_dir = resolve_ls_dir(base, &dir_part);
 
     let cache = cache_dir();
-    let key = cache_key(&host, &ls_dir);
+    let key = cache_key(host, &ls_dir);
     let cache_file = cache.join(&key);
 
-    spawn_remote_ls(&host, &ls_dir);
+    spawn_remote_ls(host, &ls_dir);
 
     let cached = match std::fs::read_to_string(&cache_file) {
         Ok(c) if !c.is_empty() => c,
@@ -424,6 +601,80 @@ fn complete_remote_path(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+fn resolve_ls_dir(base: Option<&str>, dir_part: &str) -> String {
+    if dir_part.starts_with('/') || dir_part.starts_with('~') {
+        return dir_part.to_string();
+    }
+    match base {
+        Some(base) if dir_part.is_empty() => base.to_string(),
+        Some(base) => format!("{}/{dir_part}", base.trim_end_matches('/')),
+        None if dir_part.is_empty() => "~".to_string(),
+        None => dir_part.to_string(),
+    }
+}
+
+fn remote_target_token() -> Option<String> {
+    let words = subcommand_words();
+    let start = words.iter().position(|w| {
+        matches!(
+            w.as_str(),
+            "get" | "pull" | "fetch" | "delete" | "del" | "rm-remote"
+        )
+    })?;
+    let mut i = start + 1;
+    while i < words.len() {
+        let w = &words[i];
+        if matches!(w.as_str(), "-o" | "--to" | "-p" | "--path") {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(w.clone());
+    }
+    None
+}
+
+fn resolve_target_host_base(token: &str) -> Option<(String, String)> {
+    let cfg = load_config();
+    if cfg.groups.contains_key(token) {
+        return None;
+    }
+    if let Some(srv) = cfg.servers.get(token) {
+        return Some((srv.host.clone(), srv.default_path()?.clone()));
+    }
+    let mut owners = cfg.servers.values().filter(|s| s.paths.contains_key(token));
+    let srv = owners.next()?;
+    if owners.next().is_some() {
+        return None; // ambiguous
+    }
+    Some((srv.host.clone(), srv.path_for(token)?.clone()))
+}
+
+fn complete_remote_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Some((host, base)) = remote_target_token().and_then(|t| resolve_target_host_base(&t))
+    else {
+        return Vec::new();
+    };
+    let raw_current = current.to_str().unwrap_or("");
+    remote_path_candidates(&host, Some(&base), raw_current)
+}
+
+fn complete_path_override(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let token = remote_target_token().or_else(extract_main_server_arg);
+    let Some((host, base)) = token.and_then(|t| resolve_target_host_base(&t)) else {
+        return Vec::new();
+    };
+    let raw_current = current.to_str().unwrap_or("");
+    remote_path_candidates(&host, Some(&base), raw_current)
+}
+
+fn complete_local_dir(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    local_file_candidates(current.to_str().unwrap_or(""))
+}
+
 #[derive(Parser)]
 #[command(
     name = "snd",
@@ -434,7 +685,16 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Cmd>,
 
-    #[arg(add = ArgValueCompleter::new(complete_server_alias))]
+    #[arg(short = 'f', long, global = true)]
+    pub force: bool,
+
+    #[arg(long, global = true)]
+    pub no_check: bool,
+
+    #[arg(short = 'p', long = "path", global = true, value_name = "REMOTE_PATH", add = ArgValueCompleter::new(complete_path_override))]
+    pub path: Option<String>,
+
+    #[arg(add = ArgValueCompleter::new(complete_server_or_group))]
     pub server: Option<String>,
 
     #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_main_positional))]
@@ -496,6 +756,57 @@ pub enum Cmd {
     },
     #[command(alias = "ls")]
     List,
+    #[command(alias = "pull", alias = "fetch")]
+    Get {
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        #[arg(short = 'o', long = "to", value_name = "LOCAL_DIR", add = ArgValueCompleter::new(complete_local_dir))]
+        to: Option<String>,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_remote_files))]
+        files: Vec<String>,
+    },
+    #[command(alias = "del", alias = "rm-remote")]
+    Delete {
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
+        files: Vec<String>,
+    },
+    #[command(name = "add-group")]
+    AddGroup {
+        #[arg(value_name = "GROUP_NAME")]
+        name: String,
+        #[arg(value_name = "TARGET", num_args = 1.., add = ArgValueCompleter::new(complete_group_member))]
+        targets: Vec<String>,
+    },
+    #[command(name = "remove-group", alias = "rm-group")]
+    RemoveGroup {
+        #[arg(value_name = "GROUP_NAME", add = ArgValueCompleter::new(complete_group_alias))]
+        name: String,
+    },
+    #[command(name = "add-to-group")]
+    AddToGroup {
+        #[arg(value_name = "GROUP_NAME", add = ArgValueCompleter::new(complete_group_alias))]
+        group: String,
+        #[arg(value_name = "TARGET", add = ArgValueCompleter::new(complete_group_member))]
+        target: String,
+    },
+    #[command(name = "remove-from-group", alias = "rm-from-group")]
+    RemoveFromGroup {
+        #[arg(value_name = "GROUP_NAME", add = ArgValueCompleter::new(complete_group_alias))]
+        group: String,
+        #[arg(value_name = "TARGET", add = ArgValueCompleter::new(complete_existing_group_member))]
+        target: String,
+    },
+    Doctor,
+    Refresh {
+        #[arg(add = ArgValueCompleter::new(complete_server_alias))]
+        alias: Option<String>,
+    },
     Completions {
         shell: Shell,
     },
@@ -509,6 +820,26 @@ mod tests {
     fn fuzzy_match_empty_pattern_matches_anything() {
         assert!(fuzzy_match("", "foo"));
         assert!(fuzzy_match("", ""));
+    }
+
+    #[test]
+    fn resolve_ls_dir_relative_joins_base() {
+        assert_eq!(resolve_ls_dir(Some("/srv/www"), ""), "/srv/www");
+        assert_eq!(resolve_ls_dir(Some("/srv/www/"), "sub"), "/srv/www/sub");
+        assert_eq!(resolve_ls_dir(Some("/srv/www"), "sub"), "/srv/www/sub");
+    }
+
+    #[test]
+    fn resolve_ls_dir_absolute_and_tilde_override_base() {
+        assert_eq!(resolve_ls_dir(Some("/srv/www"), "/etc"), "/etc");
+        assert_eq!(resolve_ls_dir(Some("/srv/www"), "~/x"), "~/x");
+    }
+
+    #[test]
+    fn resolve_ls_dir_no_base_falls_back_to_home() {
+        assert_eq!(resolve_ls_dir(None, ""), "~");
+        assert_eq!(resolve_ls_dir(None, "rel"), "rel");
+        assert_eq!(resolve_ls_dir(None, "/abs"), "/abs");
     }
 
     #[test]

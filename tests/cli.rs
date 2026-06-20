@@ -76,10 +76,6 @@ impl TestEnv {
     fn config_file(&self) -> PathBuf {
         self.dir.join("snd").join("servers.toml")
     }
-
-    fn legacy_file(&self) -> PathBuf {
-        self.dir.join("snd").join("servers.conf")
-    }
 }
 
 impl Drop for TestEnv {
@@ -111,7 +107,10 @@ fn add_creates_server_and_toml() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
 
     let toml_contents = std::fs::read_to_string(env.config_file()).unwrap();
-    assert!(toml_contents.contains("[web]"));
+    assert!(
+        toml_contents.contains("[servers.web]"),
+        "toml: {toml_contents}"
+    );
     assert!(toml_contents.contains("host = \"user@host.example\""));
     assert!(toml_contents.contains("default = \"default\""));
     assert!(toml_contents.contains("default = \"/var/www\""));
@@ -317,24 +316,6 @@ fn remove_unknown_fails() {
     let out = env.run(&["remove", "nope"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("not found"));
-}
-
-#[test]
-fn legacy_conf_is_migrated() {
-    let env = TestEnv::new();
-    std::fs::write(
-        env.legacy_file(),
-        "# snd server config\nweb=user@h:/var/www\ndb=dbhost:/opt/db\n",
-    )
-    .unwrap();
-    let out = env.run(&["list"]);
-    assert!(out.status.success(), "stderr: {}", stderr(&out));
-    let list = stdout(&out);
-    assert!(list.contains("web"));
-    assert!(list.contains("user@h"));
-    assert!(list.contains("db"));
-    assert!(list.contains("dbhost"));
-    assert!(env.config_file().exists(), "TOML file should be created");
 }
 
 #[test]
@@ -598,6 +579,387 @@ fn completion_dot_slash_preserves_prefix() {
 }
 
 #[test]
+fn add_group_persists_targets_to_toml() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    let out = env.run(&["add-group", "prod", "web", "api"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("[groups.prod]"), "toml: {toml}");
+    assert!(toml.contains("\"web\""));
+    assert!(toml.contains("\"api\""));
+}
+
+#[test]
+fn add_group_rejects_unknown_server() {
+    let env = TestEnv::new();
+    let out = env.run(&["add-group", "prod", "missing"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not found"));
+}
+
+#[test]
+fn add_group_rejects_duplicate_name() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = env.run(&["add-group", "prod", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("already exists"));
+}
+
+#[test]
+fn add_group_rejects_when_name_collides_with_server() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    let out = env.run(&["add-group", "web", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("server name"));
+}
+
+#[test]
+fn add_group_validates_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    let out = env.run(&["add-group", "prod", "web:nope"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not found"));
+}
+
+#[test]
+fn add_to_group_appends_target() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add", "api", "u@h2", "/b"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = env.run(&["add-to-group", "prod", "api"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("\"api\""));
+}
+
+#[test]
+fn add_group_resolves_bare_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "spawn", "/srv/spawn/plugins"]);
+    let out = env.run(&["add-group", "sb", "spawn"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("\"box1:spawn\""), "toml: {toml}");
+}
+
+#[test]
+fn add_group_ambiguous_bare_path_alias_errors() {
+    let env = TestEnv::new();
+    env.run(&["add", "a", "u@h1", "/srv/a"]);
+    env.run(&["add-path", "a", "shared", "/srv/a/shared"]);
+    env.run(&["add", "b", "u@h2", "/srv/b"]);
+    env.run(&["add-path", "b", "shared", "/srv/b/shared"]);
+    let out = env.run(&["add-group", "grp", "shared"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(
+        err.contains("'a:shared'") && err.contains("'b:shared'"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn add_to_group_resolves_bare_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "spawn", "/srv/spawn/plugins"]);
+    env.run(&["add", "web", "u@h2", "/var/www"]);
+    env.run(&["add-group", "sb", "web"]);
+    let out = env.run(&["add-to-group", "sb", "spawn"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("\"box1:spawn\""), "toml: {toml}");
+}
+
+#[test]
+fn completion_group_member_offers_path_aliases() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "spawn", "/srv/spawn/plugins"]);
+    env.run(&["add-group", "sb", "box1"]);
+    let out = env.run_complete(&["add-to-group", "sb", ""]);
+    assert!(out.contains("box1"), "completion: {out}");
+    assert!(out.contains("spawn"), "completion: {out}");
+}
+
+#[test]
+fn add_to_group_rejects_duplicate_target() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = env.run(&["add-to-group", "prod", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("already in"));
+}
+
+#[test]
+fn remove_from_group_drops_target() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add", "api", "u@h2", "/b"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    let out = env.run(&["remove-from-group", "prod", "api"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(!toml.contains("\"api\""));
+    assert!(toml.contains("\"web\""));
+}
+
+#[test]
+fn remove_from_group_deletes_empty_group() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = env.run(&["remove-from-group", "prod", "web"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let toml = std::fs::read_to_string(env.config_file()).unwrap_or_default();
+    assert!(!toml.contains("[groups."), "toml: {toml}");
+}
+
+#[test]
+fn remove_group_succeeds() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = env.run(&["remove-group", "prod"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
+
+#[test]
+fn remove_group_unknown_fails() {
+    let env = TestEnv::new();
+    let out = env.run(&["remove-group", "ghost"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not found"));
+}
+
+#[test]
+fn remove_server_prunes_group_references() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add", "api", "u@h2", "/b"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    env.run(&["remove", "web"]);
+    let toml = std::fs::read_to_string(env.config_file()).unwrap_or_default();
+    assert!(!toml.contains("\"web\""), "toml: {toml}");
+    assert!(toml.contains("\"api\""));
+}
+
+#[test]
+fn list_shows_groups() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    env.run(&["add-group", "prod", "web"]);
+    let out = stdout(&env.run(&["list"]));
+    assert!(out.contains("Groups:"), "list: {out}");
+    assert!(out.contains("prod"), "list: {out}");
+}
+
+#[test]
+fn dispatch_group_runs_scp_per_server() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h1", "/var/www"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    let out = env.run(&["--no-check", "prod", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@h1:/var/www"),
+        "stdout: {printed}"
+    );
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@h2:/srv/api"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn dispatch_group_with_path_alias_targets() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h1", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log/web"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-path", "api", "logs", "/var/log/api"]);
+    env.run(&["add-group", "alllogs", "web:logs", "api:logs"]);
+    let out = env.run(&["--no-check", "alllogs", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h1:/var/log/web"), "stdout: {printed}");
+    assert!(printed.contains("u@h2:/var/log/api"), "stdout: {printed}");
+}
+
+#[test]
+fn delete_recursive_flag_is_accepted() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    let out = env.run(&["delete", "-r", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("No files"));
+}
+
+#[test]
+fn delete_no_files_errors() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    let out = env.run(&["delete", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("No files"));
+}
+
+#[test]
+fn delete_unknown_target_errors() {
+    let env = TestEnv::new();
+    let out = env.run(&["delete", "nope", "x.txt"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("Unknown server or group"));
+}
+
+#[test]
+fn path_override_replaces_default_path() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "/tmp/once",
+        "web",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@h:/tmp/once"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn path_override_skips_path_alias_positional() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log"]);
+    let out = env.run(&["--no-check", "-p", "/tmp/once", "web", "logs"]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp logs -> u@h:/tmp/once"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn path_override_applies_to_every_group_member() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h1", "/var/www"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "/tmp/release",
+        "prod",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h1:/tmp/release"), "stdout: {printed}");
+    assert!(printed.contains("u@h2:/tmp/release"), "stdout: {printed}");
+}
+
+#[test]
+fn path_override_dot_slash_is_relative_to_base() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "./build",
+        "web",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h:/var/www/build"), "stdout: {printed}");
+}
+
+#[test]
+fn path_override_dot_slash_alone_keeps_base() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["--no-check", "-p", "./", "web", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h:/var/www"), "stdout: {printed}");
+    assert!(
+        !printed.contains("/var/www/"),
+        "shouldn't add trailing slash: {printed}"
+    );
+}
+
+#[test]
+fn path_override_dot_dot_slash_relative_to_base() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "../shared",
+        "web",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/www/../shared"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn path_override_dot_slash_resolves_per_group_member() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h1", "/var/www"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "./build",
+        "prod",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h1:/var/www/build"), "stdout: {printed}");
+    assert!(printed.contains("u@h2:/srv/api/build"), "stdout: {printed}");
+}
+
+#[test]
+fn path_override_unescapes_backslash_tilde() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "\\~/inbox",
+        "web",
+        "missing-local-file-xyz",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h:~/inbox"), "stdout: {printed}");
+}
+
+#[test]
+fn force_flag_is_global() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/a"]);
+    let out = env.run(&["-f", "list"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
+
+#[test]
 fn completion_fuzzy_narrows_path_alias() {
     let env = TestEnv::new();
     env.run(&["add", "deploy", "u@h", "/var/www"]);
@@ -607,5 +969,459 @@ fn completion_fuzzy_narrows_path_alias() {
     assert!(
         out.contains("all"),
         "fuzzy on 'al' should match 'all': {out}"
+    );
+}
+
+#[test]
+fn get_resolves_bare_name_under_server_path() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "build.tar.gz",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/www/build.tar.gz"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn get_passes_through_absolute_remote_path() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "/etc/hosts",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h:/etc/hosts"), "stdout: {printed}");
+}
+
+#[test]
+fn get_with_recursive_flag_is_accepted() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "-r",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "stale-build",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/www/stale-build"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn get_uses_path_alias_when_first_arg_matches() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log/web"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "logs",
+        "error.log",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/log/web/error.log"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn get_path_override_skips_alias_positional() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "/tmp/once",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "logs",
+    ]);
+    let printed = stdout(&out);
+    assert!(printed.contains("u@h:/tmp/once/logs"), "stdout: {printed}");
+}
+
+#[test]
+fn get_path_override_dot_slash_relative_to_base() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "-p",
+        "./build",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "app.jar",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/www/build/app.jar"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn get_group_writes_to_per_server_subdir() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h1", "/var/www"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "prod",
+        "build.tar.gz",
+    ]);
+    let printed = stdout(&out);
+    let dest = to.display().to_string();
+    assert!(
+        printed.contains(&format!("u@h1:/var/www/build.tar.gz -> {dest}/web")),
+        "stdout: {printed}"
+    );
+    assert!(
+        printed.contains(&format!("u@h2:/srv/api/build.tar.gz -> {dest}/api")),
+        "stdout: {printed}"
+    );
+    assert!(to.join("web").is_dir(), "expected {}/web", to.display());
+    assert!(to.join("api").is_dir(), "expected {}/api", to.display());
+}
+
+#[test]
+fn get_no_files_errors() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["--no-check", "get", "web"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("No remote files"));
+}
+
+#[test]
+fn get_unknown_target_errors() {
+    let env = TestEnv::new();
+    let out = env.run(&["--no-check", "get", "nope", "x.txt"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("Unknown server or group"));
+}
+
+fn make_home_with_ssh(config: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let home = std::env::temp_dir().join(format!("snd-ssh-home-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(home.join(".ssh/config"), config).unwrap();
+    home
+}
+
+#[test]
+fn add_populates_resolved_cache_for_known_alias() {
+    let env = TestEnv::new();
+    let home = make_home_with_ssh("Host myalias\n  Hostname target.test\n  User deploy\n");
+    let out = env.run_with_home(&home, &["add", "web", "myalias", "/var/www"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("[servers.web.resolved]"), "toml: {toml}");
+    assert!(toml.contains("hostname = \"target.test\""));
+    assert!(toml.contains("user = \"deploy\""));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn add_leaves_cache_empty_for_literal_user_at_host() {
+    let env = TestEnv::new();
+    let home = make_home_with_ssh("Host other\n  Hostname other.test\n");
+    let out = env.run_with_home(&home, &["add", "web", "u@literal", "/var/www"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(!toml.contains("[servers.web.resolved]"), "toml: {toml}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn doctor_reports_clean_when_cache_matches() {
+    let env = TestEnv::new();
+    let home = make_home_with_ssh("Host myalias\n  Hostname target.test\n  User deploy\n");
+    env.run_with_home(&home, &["add", "web", "myalias", "/var/www"]);
+
+    let out = env.run_with_home(&home, &["doctor"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("All servers OK"), "{}", stdout(&out));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn doctor_reports_missing_alias() {
+    let env = TestEnv::new();
+    let home_before = make_home_with_ssh("Host myalias\n  Hostname target.test\n");
+    env.run_with_home(&home_before, &["add", "web", "myalias", "/var/www"]);
+
+    let home_after = make_home_with_ssh("Host other\n  Hostname other.test\n");
+    let out = env.run_with_home(&home_after, &["doctor"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("[web]"), "stderr: {err}");
+    assert!(err.contains("no longer"), "stderr: {err}");
+    std::fs::remove_dir_all(&home_before).ok();
+    std::fs::remove_dir_all(&home_after).ok();
+}
+
+#[test]
+fn doctor_reports_drift() {
+    let env = TestEnv::new();
+    let home_before = make_home_with_ssh("Host myalias\n  Hostname target.test\n  User deploy\n");
+    env.run_with_home(&home_before, &["add", "web", "myalias", "/var/www"]);
+
+    let home_after = make_home_with_ssh("Host myalias\n  Hostname newtarget.test\n  User deploy\n");
+    let out = env.run_with_home(&home_after, &["doctor"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("resolves differently"), "stderr: {err}");
+    assert!(err.contains("snd refresh web"), "stderr: {err}");
+    std::fs::remove_dir_all(&home_before).ok();
+    std::fs::remove_dir_all(&home_after).ok();
+}
+
+#[test]
+fn refresh_updates_cache_after_drift() {
+    let env = TestEnv::new();
+    let home_before = make_home_with_ssh("Host myalias\n  Hostname target.test\n");
+    env.run_with_home(&home_before, &["add", "web", "myalias", "/var/www"]);
+
+    let home_after = make_home_with_ssh("Host myalias\n  Hostname newtarget.test\n");
+    let out = env.run_with_home(&home_after, &["refresh", "web"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("[web] updated"));
+
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(
+        toml.contains("hostname = \"newtarget.test\""),
+        "toml: {toml}"
+    );
+    assert!(!toml.contains("hostname = \"target.test\""));
+
+    let after = env.run_with_home(&home_after, &["doctor"]);
+    assert!(after.status.success(), "stderr: {}", stderr(&after));
+    std::fs::remove_dir_all(&home_before).ok();
+    std::fs::remove_dir_all(&home_after).ok();
+}
+
+#[test]
+fn refresh_unknown_server_fails() {
+    let env = TestEnv::new();
+    let home = make_home_with_ssh("");
+    let out = env.run_with_home(&home, &["refresh", "ghost"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not found"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn list_shows_ssh_missing_indicator() {
+    let env = TestEnv::new();
+    let home_before = make_home_with_ssh("Host myalias\n  Hostname target.test\n");
+    env.run_with_home(&home_before, &["add", "web", "myalias", "/var/www"]);
+
+    let home_after = make_home_with_ssh("");
+    let list = stdout(&env.run_with_home(&home_after, &["list"]));
+    assert!(list.contains("(ssh: missing)"), "list: {list}");
+    std::fs::remove_dir_all(&home_before).ok();
+    std::fs::remove_dir_all(&home_after).ok();
+}
+
+#[test]
+fn list_shows_ssh_drift_indicator() {
+    let env = TestEnv::new();
+    let home_before = make_home_with_ssh("Host myalias\n  Hostname target.test\n");
+    env.run_with_home(&home_before, &["add", "web", "myalias", "/var/www"]);
+
+    let home_after = make_home_with_ssh("Host myalias\n  Hostname newtarget.test\n");
+    let list = stdout(&env.run_with_home(&home_after, &["list"]));
+    assert!(list.contains("(ssh: drift)"), "list: {list}");
+    std::fs::remove_dir_all(&home_before).ok();
+    std::fs::remove_dir_all(&home_after).ok();
+}
+
+#[test]
+fn get_pull_alias_works() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "pull",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "build.tar.gz",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/var/www/build.tar.gz"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn dispatch_unique_path_alias_used_as_top_level() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+
+    let out = env.run(&["--no-check", "creative", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@h:/srv/creative/plugins"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn dispatch_ambiguous_path_alias_lists_options() {
+    let env = TestEnv::new();
+    env.run(&["add", "a", "u@h1", "/srv/a"]);
+    env.run(&["add-path", "a", "shared", "/srv/a/shared"]);
+    env.run(&["add", "b", "u@h2", "/srv/b"]);
+    env.run(&["add-path", "b", "shared", "/srv/b/shared"]);
+
+    let out = env.run(&["--no-check", "shared", "missing-local-file-xyz"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+    assert!(err.contains("'a shared'"), "stderr: {err}");
+    assert!(err.contains("'b shared'"), "stderr: {err}");
+}
+
+#[test]
+fn dispatch_server_name_wins_over_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "creative", "u@server", "/var/creative"]);
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+
+    let out = env.run(&["--no-check", "creative", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@server:/var/creative"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn dispatch_group_name_wins_over_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+    env.run(&["add", "other", "u@h2", "/srv/other"]);
+    env.run(&["add-group", "creative", "other"]);
+
+    let out = env.run(&["--no-check", "creative", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("scp missing-local-file-xyz -> u@h2:/srv/other"),
+        "stdout: {printed}"
+    );
+    assert!(
+        !printed.contains("/srv/creative/plugins"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn get_unique_path_alias_used_as_top_level() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "creative",
+        "build.tar.gz",
+    ]);
+    let printed = stdout(&out);
+    assert!(
+        printed.contains("u@h:/srv/creative/plugins/build.tar.gz"),
+        "stdout: {printed}"
+    );
+}
+
+#[test]
+fn delete_unique_path_alias_used_as_top_level() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+
+    let out = env.run(&["delete", "creative"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("No files"));
+}
+
+#[test]
+fn completion_unique_path_alias_offered() {
+    let env = TestEnv::new();
+    env.run(&["add", "box1", "u@h", "/srv"]);
+    env.run(&["add-path", "box1", "creative", "/srv/creative/plugins"]);
+
+    let out = env.run_complete(&[""]);
+    assert!(out.contains("creative"), "completion: {out}");
+}
+
+#[test]
+fn completion_ambiguous_path_alias_not_offered() {
+    let env = TestEnv::new();
+    env.run(&["add", "a", "u@h1", "/srv/a"]);
+    env.run(&["add-path", "a", "shared", "/srv/a/shared"]);
+    env.run(&["add", "b", "u@h2", "/srv/b"]);
+    env.run(&["add-path", "b", "shared", "/srv/b/shared"]);
+
+    let out = env.run_complete(&[""]);
+    assert!(out.contains("a"), "completion: {out}");
+    assert!(out.contains("b"), "completion: {out}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.starts_with("shared\t") || *l == "shared"),
+        "completion: {out}"
     );
 }
