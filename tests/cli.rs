@@ -2505,8 +2505,7 @@ fn direct_send_rollback_restores_the_overwritten_file() {
     );
 
     std::fs::write(&local, "newest jar").unwrap();
-    let second_send =
-        env.run_with_path(&bin, &["--no-check", "staging", local.to_str().unwrap()]);
+    let second_send = env.run_with_path(&bin, &["--no-check", "staging", local.to_str().unwrap()]);
     assert!(
         second_send.status.success(),
         "stderr: {}",
