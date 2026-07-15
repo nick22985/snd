@@ -5,13 +5,12 @@ use std::process::Command;
 
 use snd::cli::{Cli, Cmd};
 use snd::config::{
-    canonicalize_group_target, load_config, load_config_strict, parse_group_target, save_config,
-    Config, Group, Server, SshResolved,
+    Config, Group, Server, SshResolved, canonicalize_group_target, load_config, load_config_strict,
+    parse_group_target, save_config,
 };
 use snd::remote::{
-    cat_remote, confirm, destination_basename, expand_remote_glob, find_remote, format_size,
-    glob_label, grep_remote, has_glob, join_remote, ls_remote, rm_remote, stat_remote,
-    RemoteFileInfo,
+    RemoteFileInfo, cat_remote, confirm, destination_basename, expand_remote_glob, find_remote,
+    format_size, glob_label, grep_remote, has_glob, join_remote, ls_remote, rm_remote, stat_remote,
 };
 
 fn load_or_exit() -> Config {
