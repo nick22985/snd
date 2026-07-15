@@ -2490,13 +2490,13 @@ fn direct_send_rollback_restores_the_overwritten_file() {
     let local_dir = env.dir.join("out");
     std::fs::create_dir_all(&remote).unwrap();
     std::fs::create_dir_all(&local_dir).unwrap();
-    let local = local_dir.join("ManaReport.jar");
-    let deployed = remote.join("ManaReport.jar");
+    let local = local_dir.join("ExamplePlugin.jar");
+    let deployed = remote.join("ExamplePlugin.jar");
     std::fs::write(&deployed, "old jar").unwrap();
     std::fs::write(&local, "new jar").unwrap();
-    env.run(&["add", "dev-proxy", "u@h", remote.to_str().unwrap()]);
+    env.run(&["add", "staging", "u@h", remote.to_str().unwrap()]);
 
-    let send = env.run_with_path(&bin, &["--no-check", "dev-proxy", local.to_str().unwrap()]);
+    let send = env.run_with_path(&bin, &["--no-check", "staging", local.to_str().unwrap()]);
     assert!(send.status.success(), "stderr: {}", stderr(&send));
     assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "new jar");
     assert!(
@@ -2506,7 +2506,7 @@ fn direct_send_rollback_restores_the_overwritten_file() {
 
     std::fs::write(&local, "newest jar").unwrap();
     let second_send =
-        env.run_with_path(&bin, &["--no-check", "dev-proxy", local.to_str().unwrap()]);
+        env.run_with_path(&bin, &["--no-check", "staging", local.to_str().unwrap()]);
     assert!(
         second_send.status.success(),
         "stderr: {}",
@@ -2514,7 +2514,7 @@ fn direct_send_rollback_restores_the_overwritten_file() {
     );
     assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "newest jar");
 
-    let rollback = env.run_with_path(&bin, &["rollback", "dev-proxy"]);
+    let rollback = env.run_with_path(&bin, &["rollback", "staging"]);
     assert!(
         rollback.status.success(),
         "stdout: {} stderr: {}",
@@ -2528,7 +2528,7 @@ fn direct_send_rollback_restores_the_overwritten_file() {
         stdout(&rollback)
     );
 
-    let rollback_again = env.run_with_path(&bin, &["rollback", "dev-proxy"]);
+    let rollback_again = env.run_with_path(&bin, &["rollback", "staging"]);
     assert!(
         rollback_again.status.success(),
         "stdout: {} stderr: {}",

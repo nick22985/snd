@@ -12,7 +12,7 @@ You can also group servers and send to all of them at once, get a confirmation p
 ## Install
 
 ```bash
-git clone https://github.com/nick22985/snd.git
+git clone <repository-url> snd
 cd snd
 ./install.sh
 ```
@@ -101,9 +101,9 @@ about to replace. The snapshot also records destinations that did not exist,
 so rollback removes newly created files instead of leaving them behind:
 
 ```bash
-snd dev-proxy ./out/ManaReport.jar
-snd rollback dev-proxy             # restore the previous ManaReport.jar
-snd rollback dev-proxy ManaReport.jar
+snd staging ./out/ExamplePlugin.jar
+snd rollback staging               # restore the previous ExamplePlugin.jar
+snd rollback staging ExamplePlugin.jar
 ```
 
 One snapshot covers the whole send, including sends with multiple inputs. Pass
@@ -133,7 +133,7 @@ For example, if an added path resolves to `/plugins`, the deployed JAR and its
 rollback snapshot are kept separate:
 
 ```text
-/plugins/ManaReport.jar                                  # deployed file
+/plugins/ExamplePlugin.jar                               # deployed file
 $HOME/.local/share/snd/targets/<hash>/backups/...        # rollback data
 ```
 
@@ -143,9 +143,9 @@ Inspect every available transaction, or only the history for one destination
 name, without downloading the backed-up payloads:
 
 ```bash
-snd history dev-proxy
-snd history dev-proxy ManaReport.jar
-snd --json history dev-proxy
+snd history staging
+snd history staging ExamplePlugin.jar
+snd --json history staging
 ```
 
 ### Compare and synchronize

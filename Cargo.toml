@@ -3,7 +3,6 @@ name = "snd"
 version = "0.1.5"
 edition = "2024"
 description = "Quick scp to configured servers"
-authors = ["nick22985"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
