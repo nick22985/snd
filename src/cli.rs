@@ -304,7 +304,7 @@ fn extract_server_arg() -> Option<String> {
     None
 }
 
-fn cache_dir() -> std::path::PathBuf {
+pub fn completion_cache_dir() -> std::path::PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("snd")
@@ -318,8 +318,47 @@ fn cache_key(host: &str, dir: &str) -> String {
     )
 }
 
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn remote_shell_path(path: &str) -> String {
+    if path == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("\"$HOME\"/{}", shell_quote(rest));
+    }
+    if let Some(tilde_path) = path.strip_prefix('~') {
+        let (user, rest) = tilde_path
+            .split_once('/')
+            .map_or((tilde_path, None), |(user, rest)| (user, Some(rest)));
+        if !user.is_empty()
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return match rest {
+                Some(rest) => format!("~{user}/{}", shell_quote(rest)),
+                None => format!("~{user}"),
+            };
+        }
+    }
+    shell_quote(path)
+}
+
 fn spawn_remote_ls(host: &str, remote_dir: &str) {
-    let cache = cache_dir();
+    let cache = completion_cache_dir();
     let _ = std::fs::create_dir_all(&cache);
     let key = cache_key(host, remote_dir);
     let cache_file = cache.join(&key);
@@ -335,30 +374,33 @@ fn spawn_remote_ls(host: &str, remote_dir: &str) {
 
     let _ = std::fs::write(&lock_file, "");
 
-    let cache_path = cache_file.to_string_lossy().to_string();
-    let lock_path = lock_file.to_string_lossy().to_string();
+    let remote_cmd = format!("cd {} && pwd && ls -1p", remote_shell_path(remote_dir));
+    let cache_path = cache_file.to_string_lossy().into_owned();
+    let lock_path = lock_file.to_string_lossy().into_owned();
 
+    // The command text is constant and every dynamic value is passed as a
+    // positional parameter. This keeps host names, remote paths, and cache
+    // paths out of the local shell's syntax while retaining background cache
+    // refresh and lock cleanup.
+    const WORKER: &str = concat!(
+        "nohup sh -c '",
+        "if ssh -o BatchMode=yes -o ConnectTimeout=3",
+        " -o StrictHostKeyChecking=accept-new",
+        " -o ControlMaster=auto",
+        " -o \"ControlPath=~/.ssh/snd-%r@%h:%p\"",
+        " -o ControlPersist=60 -- \"$1\" \"$2\" >\"$3.tmp\" 2>/dev/null; then ",
+        "mv -f \"$3.tmp\" \"$3\"; else rm -f \"$3.tmp\"; fi; ",
+        "rm -f \"$4\"",
+        "' snd-completion \"$1\" \"$2\" \"$3\" \"$4\" >/dev/null 2>&1 &",
+    );
     let _ = Command::new("sh")
-        .args([
-            "-c",
-            &format!(
-                concat!(
-                    "nohup sh -c '",
-                    "ssh -o BatchMode=yes -o ConnectTimeout=3",
-                    " -o StrictHostKeyChecking=accept-new",
-                    " -o ControlMaster=auto",
-                    " -o \"ControlPath=~/.ssh/snd-%r@%h:%p\"",
-                    " -o ControlPersist=60",
-                    " {host} '\"'\"'cd {remote_dir} && pwd && ls -1p'\"'\"'",
-                    " > {cache} 2>/dev/null; rm -f {lock}",
-                    "' >/dev/null 2>&1 &",
-                ),
-                host = host,
-                remote_dir = remote_dir,
-                cache = cache_path,
-                lock = lock_path,
-            ),
-        ])
+        .arg("-c")
+        .arg(WORKER)
+        .arg("snd-completion-launcher")
+        .arg(host)
+        .arg(remote_cmd)
+        .arg(cache_path)
+        .arg(lock_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -372,6 +414,7 @@ fn extract_main_server_arg() -> Option<String> {
         return None;
     }
     const SUBCOMMANDS: &[&str] = &[
+        "plan",
         "add",
         "remove",
         "rm",
@@ -402,6 +445,17 @@ fn extract_main_server_arg() -> Option<String> {
         "rm-from-group",
         "doctor",
         "refresh",
+        "init",
+        "config",
+        "diff",
+        "sync",
+        "apply",
+        "release",
+        "rollback",
+        "history",
+        "audit",
+        "releases",
+        "cache",
     ];
     if SUBCOMMANDS.contains(&first.as_str()) {
         return None;
@@ -564,7 +618,7 @@ fn remote_path_candidates(
     };
     let ls_dir = resolve_ls_dir(base, &dir_part);
 
-    let cache = cache_dir();
+    let cache = completion_cache_dir();
     let key = cache_key(host, &ls_dir);
     let cache_file = cache.join(&key);
 
@@ -934,6 +988,77 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_check: bool,
 
+    /// Resolve and validate the operation without changing files.
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
+    /// Emit machine-readable JSON where supported.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Read or mutate the nearest project-local .snd.toml where supported.
+    #[arg(long, global = true)]
+    pub local: bool,
+
+    /// Show transfer progress in human-readable mode.
+    #[arg(long, global = true)]
+    pub progress: bool,
+
+    /// Append structured operation records to a JSON Lines audit log.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub audit_log: Option<String>,
+
+    /// Do not snapshot overwritten direct-send destinations for rollback.
+    #[arg(long, global = true)]
+    pub no_backup: bool,
+
+    /// Number of successful direct-send snapshots retained per remote path (0 keeps all).
+    #[arg(long, global = true, default_value_t = 10, value_name = "N")]
+    pub backup_keep: usize,
+
+    /// Maximum number of target operations to run concurrently.
+    #[arg(long, global = true, default_value_t = 1, value_name = "N")]
+    pub jobs: usize,
+
+    /// Stop scheduling targets after the first failure.
+    #[arg(long, global = true, conflicts_with = "continue_on_error")]
+    pub fail_fast: bool,
+
+    /// Continue processing other targets after failures (the default).
+    #[arg(long = "continue", global = true, conflicts_with = "fail_fast")]
+    pub continue_on_error: bool,
+
+    /// Retry failed transfers this many times.
+    #[arg(long, global = true, default_value_t = 0, value_name = "N")]
+    pub retries: u32,
+
+    #[arg(long, global = true)]
+    pub preserve: bool,
+
+    #[arg(short = 'C', long, global = true)]
+    pub compress: bool,
+
+    #[arg(long, global = true, value_name = "KBIT/S")]
+    pub limit: Option<u64>,
+
+    #[arg(short = 'i', long, global = true, value_name = "KEY_FILE")]
+    pub identity: Option<String>,
+
+    #[arg(short = 'F', long = "ssh-config", global = true, value_name = "FILE")]
+    pub ssh_config: Option<String>,
+
+    /// Upload through a temporary file and rename it into place.
+    #[arg(long, global = true)]
+    pub atomic: bool,
+
+    /// Verify transferred regular files with SHA-256.
+    #[arg(long, global = true)]
+    pub verify: bool,
+
+    /// Resume partial regular-file transfers through SFTP.
+    #[arg(long, global = true)]
+    pub resume: bool,
+
     #[arg(short = 'p', long = "path", global = true, value_name = "REMOTE_PATH", add = ArgValueCompleter::new(complete_path_override))]
     pub path: Option<String>,
 
@@ -946,6 +1071,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
+    /// Show the fully resolved send operation without executing it.
+    Plan {
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "[PATH_ALIAS_OR_DIR] FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_main_positional))]
+        files: Vec<String>,
+    },
     Add {
         #[arg(value_name = "ALIAS")]
         alias: String,
@@ -1071,10 +1203,111 @@ pub enum Cmd {
         #[arg(value_name = "TARGET", add = ArgValueCompleter::new(complete_existing_group_member))]
         target: String,
     },
-    Doctor,
+    Doctor {
+        /// Connect and validate remote paths, tools, and effective SSH settings.
+        #[arg(long)]
+        connect: bool,
+    },
     Refresh {
         #[arg(add = ArgValueCompleter::new(complete_server_alias))]
         alias: Option<String>,
+    },
+    /// Create a project-local .snd.toml configuration.
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the merged global and project configuration.
+    Config {
+        #[arg(value_parser = ["show", "validate", "edit"])]
+        action: Option<String>,
+        /// Explicitly request the merged effective configuration.
+        #[arg(long)]
+        resolved: bool,
+        #[arg(long)]
+        paths: bool,
+    },
+    /// Compare local files with their remote destinations.
+    Diff {
+        #[arg(long)]
+        hash: bool,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "[PATH_ALIAS] FILE", trailing_var_arg = true)]
+        files: Vec<String>,
+    },
+    /// Synchronize a local directory using rsync after showing its plan.
+    Sync {
+        #[arg(long)]
+        delete: bool,
+        #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append)]
+        include: Vec<String>,
+        #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
+        #[arg(long, value_name = "FILE")]
+        ignore_file: Option<String>,
+        /// Do not automatically load LOCAL_DIR/.sndignore.
+        #[arg(long)]
+        no_ignore: bool,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "LOCAL_DIR", add = ArgValueCompleter::new(complete_local_dir))]
+        source: String,
+    },
+    /// Apply one or more named deployments from a manifest.
+    Apply {
+        #[arg(default_value = "snd.deploy.toml", value_name = "MANIFEST")]
+        manifest: String,
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Upload a versioned, verified release and activate it.
+    #[command(name = "release")]
+    Deploy {
+        #[arg(long, value_name = "RELEASE")]
+        release: Option<String>,
+        #[arg(long, default_value_t = 5, value_name = "N")]
+        keep: usize,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_main_positional))]
+        files: Vec<String>,
+    },
+    Rollback {
+        #[arg(long, value_name = "RELEASE")]
+        to: Option<String>,
+        #[arg(long)]
+        release: bool,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
+        files: Vec<String>,
+    },
+    History {
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "FILE", add = ArgValueCompleter::new(complete_remote_files))]
+        file: Option<String>,
+    },
+    Audit {
+        #[arg(value_name = "LOGFILE")]
+        file: String,
+        #[arg(short = 'n', long, default_value_t = 20, value_name = "N")]
+        last: usize,
+        #[arg(long, value_name = "COMMAND")]
+        command: Option<String>,
+        #[arg(long)]
+        failed: bool,
+    },
+    Releases {
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+    },
+    Cache {
+        #[arg(default_value = "show", value_parser = ["show", "clear"])]
+        action: String,
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
     },
     Completions {
         shell: Shell,
@@ -1325,5 +1558,23 @@ mod tests {
         assert_eq!(filtered_values, vec![expected_notes]);
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn completion_remote_path_is_shell_quoted_without_breaking_tilde() {
+        assert_eq!(remote_shell_path("~"), "\"$HOME\"");
+        assert_eq!(
+            remote_shell_path("~/my dir/it's;safe"),
+            "\"$HOME\"/'my dir/it'\\''s;safe'"
+        );
+        assert_eq!(
+            remote_shell_path("~deploy/my dir/it's;safe"),
+            "~deploy/'my dir/it'\\''s;safe'"
+        );
+        assert_eq!(remote_shell_path("~deploy"), "~deploy");
+        assert_eq!(
+            remote_shell_path("/srv/a; touch /tmp/pwn"),
+            "'/srv/a; touch /tmp/pwn'"
+        );
     }
 }

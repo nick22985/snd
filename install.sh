@@ -3,6 +3,7 @@ set -euo pipefail
 
 cargo build --release
 
+mkdir -p ~/.local/bin
 cp target/release/snd ~/.local/bin/snd
 
 mkdir -p ~/.config/snd

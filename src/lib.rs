@@ -1,4 +1,9 @@
+pub mod backup;
 pub mod cli;
 pub mod config;
+pub mod deploy;
+pub mod manifest;
 pub mod remote;
+pub mod report;
 pub mod ssh;
+pub mod transfer;

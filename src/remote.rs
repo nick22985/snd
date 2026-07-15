@@ -1,6 +1,21 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use crate::transfer::TransferOptions;
+
+static TRANSFER_OPTIONS: OnceLock<TransferOptions> = OnceLock::new();
+
+pub fn set_transfer_options(options: TransferOptions) {
+    let _ = TRANSFER_OPTIONS.set(options);
+}
+
+fn apply_ssh_options(command: &mut Command) {
+    if let Some(options) = TRANSFER_OPTIONS.get() {
+        options.apply_ssh(command);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteFileInfo {
@@ -30,12 +45,121 @@ fn shell_quote(s: &str) -> String {
     out
 }
 
+fn remote_path_quote(path: &str) -> String {
+    if path == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("\"$HOME\"/{}", shell_quote(rest));
+    }
+    if let Some(tilde_path) = path.strip_prefix('~') {
+        let (user, rest) = tilde_path
+            .split_once('/')
+            .map_or((tilde_path, None), |(user, rest)| (user, Some(rest)));
+        if !user.is_empty()
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return match rest {
+                Some(rest) => format!("~{user}/{}", shell_quote(rest)),
+                None => format!("~{user}"),
+            };
+        }
+    }
+    shell_quote(path)
+}
+
 pub fn has_glob(path: &str) -> bool {
     path.contains(['*', '?', '['])
 }
 
+pub fn has_unescaped_glob(path: &str) -> bool {
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && chars
+                .peek()
+                .is_some_and(|next| matches!(*next, '\\' | '*' | '?' | '[' | ']'))
+        {
+            let _ = chars.next();
+            continue;
+        }
+        if matches!(c, '*' | '?' | '[') {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn unescape_glob_literals(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && chars
+                .peek()
+                .is_some_and(|next| matches!(*next, '\\' | '*' | '?' | '[' | ']'))
+        {
+            out.push(chars.next().expect("peeked escaped glob character"));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn scp_literal_remote_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn shell_glob_word(pattern: &str) -> Result<String, String> {
+    if pattern.contains(['\n', '\r']) {
+        return Err("glob paths cannot contain newlines".to_string());
+    }
+
+    let mut out = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        if c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '/' | '_'
+                    | '-'
+                    | '.'
+                    | '~'
+                    | '@'
+                    | ':'
+                    | '%'
+                    | '+'
+                    | '='
+                    | ','
+                    | '!'
+                    | '^'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+            )
+        {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
 pub fn expand_remote_glob(host: &str, pattern: &str) -> Result<Vec<String>, String> {
-    let cmd = format!("for p in {pattern}; do [ -e \"$p\" ] && printf '%s\\n' \"$p\"; done");
+    let pattern = shell_glob_word(pattern)?;
+    let cmd = format!("for p in {pattern}; do [ -d \"$p\" ] && printf '%s\\n' \"$p\"; done");
     let out = ssh_run(host, &cmd).map_err(|e| format!("ssh: {e}"))?;
     if out.status.code() == Some(255) {
         return Err(ssh_error_message(host, &out.stderr));
@@ -93,7 +217,9 @@ pub fn destination_basename(local: &str) -> Option<String> {
 }
 
 pub fn ssh_run(host: &str, remote_cmd: &str) -> io::Result<std::process::Output> {
-    Command::new("ssh")
+    let mut command = Command::new("ssh");
+    apply_ssh_options(&mut command);
+    command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
@@ -104,6 +230,7 @@ pub fn ssh_run(host: &str, remote_cmd: &str) -> io::Result<std::process::Output>
         .arg("ControlPath=~/.ssh/snd-%r@%h:%p")
         .arg("-o")
         .arg("ControlPersist=60")
+        .arg("--")
         .arg(host)
         .arg(remote_cmd)
         .output()
@@ -126,7 +253,7 @@ fn build_find_cmd(
     case_sensitive: bool,
     max_depth: Option<u32>,
 ) -> String {
-    let mut cmd = format!("find {}", shell_quote(base));
+    let mut cmd = format!("find {}", remote_path_quote(base));
     if let Some(d) = max_depth {
         cmd.push_str(&format!(" -maxdepth {d}"));
     }
@@ -174,7 +301,7 @@ fn build_grep_cmd(
     cmd.push_str(&format!(
         " -e {} -- {}",
         shell_quote(pattern),
-        shell_quote(base)
+        remote_path_quote(base)
     ));
     cmd
 }
@@ -245,10 +372,20 @@ pub fn stat_remote(host: &str, paths: &[String]) -> Result<Vec<RemoteFileInfo>, 
     if paths.is_empty() {
         return Ok(Vec::new());
     }
-    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    let quoted: Vec<String> = paths.iter().map(|p| remote_path_quote(p)).collect();
     let joined = quoted.join(" ");
     let cmd = format!(
-        "stat -c '%n|%s|%y|%F' {joined} 2>/dev/null || stat -f '%N|%z|%Sm|%HT' -t '%Y-%m-%d %H:%M:%S' {joined} 2>/dev/null"
+        concat!(
+            "if stat -c '%s' / >/dev/null 2>&1; then style=gnu; else style=bsd; fi; ",
+            "i=0; for p in {joined}; do ",
+            "if [ -e \"$p\" ] || [ -L \"$p\" ]; then ",
+            "if [ \"$style\" = gnu ]; then ",
+            "data=$(stat -c '%s|%y|%F' \"$p\" 2>/dev/null); ",
+            "else data=$(stat -f '%z|%Sm|%HT' -t '%Y-%m-%d %H:%M:%S' \"$p\" 2>/dev/null); fi; ",
+            "[ -n \"$data\" ] && printf '%s|%s\\n' \"$i\" \"$data\"; ",
+            "fi; i=$((i + 1)); done"
+        ),
+        joined = joined
     );
     let out = ssh_run(host, &cmd).map_err(|e| format!("ssh: {e}"))?;
 
@@ -256,14 +393,25 @@ pub fn stat_remote(host: &str, paths: &[String]) -> Result<Vec<RemoteFileInfo>, 
         return Err(ssh_error_message(host, &out.stderr));
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_stat_output(
+        paths,
+        &String::from_utf8_lossy(&out.stdout),
+    ))
+}
+
+fn parse_stat_output(paths: &[String], stdout: &str) -> Vec<RemoteFileInfo> {
     let mut results = Vec::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.splitn(4, '|').collect();
         if parts.len() < 4 {
             continue;
         }
-        let path = parts[0].to_string();
+        let Ok(index) = parts[0].parse::<usize>() else {
+            continue;
+        };
+        let Some(path) = paths.get(index).cloned() else {
+            continue;
+        };
         let size: u64 = parts[1].trim().parse().unwrap_or(0);
         let mtime = clean_mtime(parts[2]);
         let kind = parts[3].to_lowercase();
@@ -275,7 +423,7 @@ pub fn stat_remote(host: &str, paths: &[String]) -> Result<Vec<RemoteFileInfo>, 
             is_dir,
         });
     }
-    Ok(results)
+    results
 }
 
 fn clean_mtime(raw: &str) -> String {
@@ -317,27 +465,30 @@ pub fn rm_remote(
     paths: &[String],
     recursive: bool,
 ) -> io::Result<std::process::ExitStatus> {
-    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    let quoted: Vec<String> = paths.iter().map(|p| remote_path_quote(p)).collect();
     let joined = quoted.join(" ");
     let cmd = if recursive {
         format!("rm -rf -- {joined}")
     } else {
         format!("rm -- {joined}")
     };
-    Command::new("ssh")
+    let mut command = Command::new("ssh");
+    apply_ssh_options(&mut command);
+    command
         .arg("-o")
         .arg("ControlMaster=auto")
         .arg("-o")
         .arg("ControlPath=~/.ssh/snd-%r@%h:%p")
         .arg("-o")
         .arg("ControlPersist=60")
+        .arg("--")
         .arg(host)
         .arg(cmd)
         .status()
 }
 
 fn build_cat_cmd(paths: &[String]) -> String {
-    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    let quoted: Vec<String> = paths.iter().map(|p| remote_path_quote(p)).collect();
     format!("cat -- {}", quoted.join(" "))
 }
 
@@ -391,7 +542,7 @@ pub fn cat_remote(
 }
 
 fn build_ls_cmd(path: &str) -> String {
-    format!("ls -lhA -- {}", shell_quote(path))
+    format!("ls -lhA -- {}", remote_path_quote(path))
 }
 
 fn colorize_ls_line(line: &str) -> String {
@@ -481,6 +632,7 @@ pub fn ls_remote(host: &str, path: &str, color: bool) -> io::Result<std::process
 
 fn ssh_command(host: &str, remote_cmd: &str) -> Command {
     let mut c = Command::new("ssh");
+    apply_ssh_options(&mut c);
     c.arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
@@ -491,6 +643,7 @@ fn ssh_command(host: &str, remote_cmd: &str) -> Command {
         .arg("ControlPath=~/.ssh/snd-%r@%h:%p")
         .arg("-o")
         .arg("ControlPersist=60")
+        .arg("--")
         .arg(host)
         .arg(remote_cmd);
     c
@@ -522,6 +675,11 @@ mod tests {
     fn shell_quote_wraps_unsafe_chars() {
         assert_eq!(shell_quote("hello world"), "'hello world'");
         assert_eq!(shell_quote("a$b"), "'a$b'");
+        assert_eq!(
+            remote_path_quote("~/hello world"),
+            "\"$HOME\"/'hello world'"
+        );
+        assert_eq!(remote_path_quote("~deploy/a b"), "~deploy/'a b'");
     }
 
     #[test]
@@ -532,6 +690,48 @@ mod tests {
     #[test]
     fn shell_quote_empty() {
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_glob_word_preserves_globs_and_escapes_shell_syntax() {
+        assert_eq!(
+            shell_glob_word("/srv/app-*; touch /tmp/pwn").unwrap(),
+            "/srv/app-*\\;\\ touch\\ /tmp/pwn"
+        );
+        assert_eq!(
+            shell_glob_word("~/instances/app-[12]?/plugins").unwrap(),
+            "~/instances/app-[12]?/plugins"
+        );
+        assert_eq!(
+            shell_glob_word("~/instances/app-[!2]/plugins").unwrap(),
+            "~/instances/app-[!2]/plugins"
+        );
+        assert!(shell_glob_word("/tmp/*\nnext").is_err());
+    }
+
+    #[test]
+    fn escaped_download_globs_are_treated_as_literal_characters() {
+        assert!(has_unescaped_glob("*.log"));
+        assert!(has_unescaped_glob("report[12].txt"));
+        assert!(!has_unescaped_glob(r"report\[1\].txt"));
+        assert_eq!(unescape_glob_literals(r"report\[1\].txt"), "report[1].txt");
+        assert_eq!(
+            scp_literal_remote_path("/srv/report[1].txt"),
+            r"/srv/report\[1\].txt"
+        );
+    }
+
+    #[test]
+    fn stat_output_uses_request_index_instead_of_filename_delimiters() {
+        let paths = vec!["/tmp/a|b".to_string()];
+        let infos = parse_stat_output(
+            &paths,
+            "0|123|2026-07-15 12:00:00.000000000 +0000|regular file\n",
+        );
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].path, "/tmp/a|b");
+        assert_eq!(infos[0].size, 123);
+        assert!(!infos[0].is_dir);
     }
 
     #[test]

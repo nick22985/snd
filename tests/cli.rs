@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -25,10 +26,41 @@ impl TestEnv {
             .expect("spawn snd binary")
     }
 
+    fn run_in(&self, cwd: &std::path::Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_snd"))
+            .current_dir(cwd)
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env_remove("COMPLETE")
+            .args(args)
+            .output()
+            .expect("spawn snd binary")
+    }
+
     fn run_with_home(&self, home: &std::path::Path, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_snd"))
             .env("XDG_CONFIG_HOME", &self.dir)
             .env("HOME", home)
+            .env_remove("COMPLETE")
+            .args(args)
+            .output()
+            .expect("spawn snd binary")
+    }
+
+    fn run_with_cache(&self, cache: &std::path::Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_snd"))
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env("XDG_CACHE_HOME", cache)
+            .env_remove("COMPLETE")
+            .args(args)
+            .output()
+            .expect("spawn snd binary")
+    }
+
+    fn run_with_editor(&self, editor: &std::path::Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_snd"))
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env("EDITOR", editor)
+            .env_remove("VISUAL")
             .env_remove("COMPLETE")
             .args(args)
             .output()
@@ -76,6 +108,22 @@ impl TestEnv {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn run_complete_with_path(&self, extra_path: &std::path::Path, line: &[&str]) -> String {
+        let mut full = vec!["--", "snd"];
+        full.extend_from_slice(line);
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{existing}", extra_path.display());
+        let output = Command::new(env!("CARGO_BIN_EXE_snd"))
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
+            .env("PATH", path)
+            .env("COMPLETE", "fish")
+            .args(&full)
+            .output()
+            .expect("spawn snd binary for completion");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     fn config_file(&self) -> PathBuf {
         self.dir.join("snd").join("servers.toml")
     }
@@ -102,11 +150,39 @@ impl TestEnv {
         let path = format!("{}:{existing}", extra_path.display());
         Command::new(env!("CARGO_BIN_EXE_snd"))
             .env("XDG_CONFIG_HOME", &self.dir)
+            .env("HOME", self.dir.join("home"))
             .env("PATH", path)
             .env_remove("COMPLETE")
             .args(args)
             .output()
             .expect("spawn snd binary")
+    }
+
+    fn run_with_path_and_input(
+        &self,
+        extra_path: &std::path::Path,
+        args: &[&str],
+        input: &str,
+    ) -> Output {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{existing}", extra_path.display());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_snd"))
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env("PATH", path)
+            .env_remove("COMPLETE")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn snd binary");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().expect("wait for snd binary")
     }
 }
 
@@ -133,6 +209,201 @@ fn list_empty_says_no_servers() {
 }
 
 #[test]
+fn malformed_config_is_reported_and_not_overwritten() {
+    let env = TestEnv::new();
+    let malformed = "this is not valid toml = [";
+    std::fs::write(env.config_file(), malformed).unwrap();
+
+    let out = env.run(&["add", "web", "u@h", "/var/www"]);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("Config error"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.config_file()).unwrap(),
+        malformed
+    );
+}
+
+#[test]
+fn project_config_is_layered_over_global_config() {
+    let env = TestEnv::new();
+    env.run(&["add", "global", "u@g", "/global"]);
+    let project = env.dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join(".snd.toml"),
+        r#"version = 1
+
+[servers.local]
+host = "u@l"
+default = "default"
+
+[servers.local.paths]
+default = "/local"
+"#,
+    )
+    .unwrap();
+
+    let out = env.run_in(&project, &["list"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("global"), "stdout: {}", stdout(&out));
+    assert!(stdout(&out).contains("local"), "stdout: {}", stdout(&out));
+}
+
+#[test]
+fn init_creates_project_config() {
+    let env = TestEnv::new();
+    let project = env.dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let out = env.run_in(&project, &["init"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let config = std::fs::read_to_string(project.join(".snd.toml")).unwrap();
+    assert!(config.contains("version = 1"), "config: {config}");
+}
+
+#[test]
+fn local_mutations_write_the_project_config_only() {
+    let env = TestEnv::new();
+    let project = env.dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    assert!(env.run_in(&project, &["init"]).status.success());
+
+    let out = env.run_in(
+        &project,
+        &["--local", "add", "staging", "u@h", "/srv/staging"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let project_config = std::fs::read_to_string(project.join(".snd.toml")).unwrap();
+    assert!(project_config.contains("[servers.staging]"));
+    assert!(
+        !std::fs::read_to_string(env.config_file())
+            .unwrap_or_default()
+            .contains("[servers.staging]")
+    );
+}
+
+#[test]
+fn config_validate_reports_semantic_errors() {
+    let env = TestEnv::new();
+    std::fs::write(
+        env.config_file(),
+        r#"version = 1
+
+[servers.web]
+host = "u@h"
+default = "missing"
+
+[servers.web.paths]
+default = "/srv"
+"#,
+    )
+    .unwrap();
+    let out = env.run(&["config", "validate"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("does not exist"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_edit_runs_the_editor_and_validates_afterward() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/srv"]);
+    let editor = env.dir.join("editor");
+    std::fs::write(&editor, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = env.run_with_editor(&editor, &["config", "edit"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("Validated"));
+}
+
+#[test]
+fn cache_show_and_clear_manage_completion_files() {
+    let env = TestEnv::new();
+    let cache_root = env.dir.join("cache-root");
+    let cache = cache_root.join("snd");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("entry"), "cached").unwrap();
+
+    let show = env.run_with_cache(&cache_root, &["cache", "show"]);
+    assert!(show.status.success());
+    assert!(stdout(&show).contains("entry"), "stdout: {}", stdout(&show));
+
+    let clear = env.run_with_cache(&cache_root, &["cache", "clear"]);
+    assert!(clear.status.success());
+    assert!(!cache.join("entry").exists());
+}
+
+#[test]
+fn manifest_apply_resolves_files_relative_to_the_manifest() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/srv"]);
+    let project = env.dir.join("manifest-project");
+    std::fs::create_dir_all(project.join("dist")).unwrap();
+    std::fs::write(project.join("dist/app.bin"), "payload").unwrap();
+    let manifest = project.join("deploy.toml");
+    std::fs::write(
+        &manifest,
+        r#"version = 1
+
+[deploy.web]
+target = "web"
+files = ["dist/app.bin"]
+atomic = true
+verify = true
+"#,
+    )
+    .unwrap();
+
+    let out = env.run(&[
+        "--dry-run",
+        "--json",
+        "--no-check",
+        "apply",
+        manifest.to_str().unwrap(),
+        "--name",
+        "web",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["command"], "plan");
+    assert_eq!(
+        value["data"][0]["files"][0],
+        project.join("dist/app.bin").to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn add_rejects_path_shaped_aliases() {
+    let env = TestEnv::new();
+    let out = env.run(&["add", "../escape", "u@h", "/srv"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("Invalid server alias"));
+}
+
+#[test]
+fn plan_and_json_dry_run_do_not_invoke_scp() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/srv"]);
+    let out = env.run(&["--no-check", "--json", "plan", "web", "missing-local-file"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["command"], "plan");
+    assert_eq!(value["data"][0]["action"], "upload");
+    assert_eq!(value["data"][0]["target"], "web");
+}
+
+#[test]
 fn add_creates_server_and_toml() {
     let env = TestEnv::new();
     let out = env.run(&["add", "web", "user@host.example", "/var/www"]);
@@ -146,6 +417,17 @@ fn add_creates_server_and_toml() {
     assert!(toml_contents.contains("host = \"user@host.example\""));
     assert!(toml_contents.contains("default = \"default\""));
     assert!(toml_contents.contains("default = \"/var/www\""));
+}
+
+#[test]
+fn config_writes_keep_the_previous_file_as_a_backup() {
+    let env = TestEnv::new();
+    assert!(env.run(&["add", "web", "u@h", "/web"]).status.success());
+    assert!(env.run(&["add", "api", "u@h", "/api"]).status.success());
+
+    let backup = std::fs::read_to_string(env.dir.join("snd").join("servers.toml.bak")).unwrap();
+    assert!(backup.contains("[servers.web]"), "backup: {backup}");
+    assert!(!backup.contains("[servers.api]"), "backup: {backup}");
 }
 
 #[test]
@@ -314,6 +596,27 @@ fn edit_changes_host_preserves_paths() {
     let toml = std::fs::read_to_string(env.config_file()).unwrap();
     assert!(toml.contains("host = \"new@host\""));
     assert!(toml.contains("/var/log"));
+}
+
+#[test]
+fn edit_refreshes_the_ssh_resolution_cache() {
+    let env = TestEnv::new();
+    let home = make_home_with_ssh(
+        "Host oldalias\n  Hostname old.test\n\nHost newalias\n  Hostname new.test\n  User deploy\n",
+    );
+    env.run_with_home(&home, &["add", "web", "oldalias", "/var/www"]);
+
+    let edited = env.run_with_home(&home, &["edit", "web", "newalias"]);
+    assert!(edited.status.success(), "stderr: {}", stderr(&edited));
+    let doctor = env.run_with_home(&home, &["doctor"]);
+    assert!(doctor.status.success(), "stderr: {}", stderr(&doctor));
+
+    let toml = std::fs::read_to_string(env.config_file()).unwrap();
+    assert!(toml.contains("host = \"newalias\""), "toml: {toml}");
+    assert!(toml.contains("hostname = \"new.test\""), "toml: {toml}");
+    assert!(toml.contains("user = \"deploy\""), "toml: {toml}");
+    assert!(!toml.contains("hostname = \"old.test\""), "toml: {toml}");
+    std::fs::remove_dir_all(home).ok();
 }
 
 #[test]
@@ -1277,6 +1580,91 @@ fn get_group_writes_to_per_server_subdir() {
 }
 
 #[test]
+fn get_group_distinguishes_multiple_paths_on_the_same_server() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log"]);
+    env.run(&["add-group", "both", "web", "web:logs"]);
+    let to = env.dir.join("dl");
+
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "both",
+        "same.txt",
+    ]);
+    let printed = stdout(&out);
+    let dest = to.display().to_string();
+    assert!(
+        printed.contains(&format!("u@h:/var/www/same.txt -> {dest}/web-default")),
+        "stdout: {printed}"
+    );
+    assert!(
+        printed.contains(&format!("u@h:/var/log/same.txt -> {dest}/web-logs")),
+        "stdout: {printed}"
+    );
+    assert!(to.join("web-default").is_dir());
+    assert!(to.join("web-logs").is_dir());
+}
+
+#[test]
+fn get_treats_hyphen_prefixed_values_as_remote_files() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "-leading.txt",
+    ]);
+
+    assert!(
+        stdout(&out).contains("u@h:/var/www/-leading.txt"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn get_rejects_wildcards_that_bypass_overwrite_checks() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["get", "web", "*.log"]);
+
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("Wildcard downloads are not supported safely"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn get_accepts_escaped_literal_glob_characters() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["--no-check", "get", "web", r"report\[1\].txt"]);
+
+    assert!(
+        stdout(&out).contains("u@h:/var/www/report[1].txt"),
+        "stdout: {}\nstderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("Wildcard downloads are not supported safely"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn get_no_files_errors() {
     let env = TestEnv::new();
     env.run(&["add", "web", "u@h", "/var/www"]);
@@ -1688,6 +2076,761 @@ fn write_fake_ssh_tools(bin_dir: &std::path::Path) {
 }
 
 #[cfg(unix)]
+fn write_fake_copy_ssh_tools(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let ssh = "#!/bin/sh\nfor last; do :; done\nsh -c \"$last\"\n";
+    let scp = r#"#!/bin/sh
+dest=
+for arg do
+    case "$arg" in
+        -*) ;;
+        *:*) dest=${arg#*:} ;;
+    esac
+done
+for src do
+    case "$src" in
+        -*) continue ;;
+        *:*) continue ;;
+    esac
+    if [ -d "$src" ] && [ -d "$dest" ]; then
+        target="$dest/${src##*/}"
+        rm -rf -- "$target"
+    fi
+    cp -R -- "$src" "$dest"
+done
+"#;
+    for (name, body) in [("ssh", ssh), ("scp", scp)] {
+        let path = bin_dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_resume_ssh_tools(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    write_fake_copy_ssh_tools(bin_dir);
+    let sftp = r#"#!/bin/sh
+line=$(cat)
+eval "set -- $line"
+case "$1" in
+    reput)
+        local=$2
+        remote=$3
+        offset=0
+        if [ -f "$remote" ]; then offset=$(wc -c < "$remote"); fi
+        tail -c +$((offset + 1)) "$local" >> "$remote"
+        ;;
+    reget)
+        remote=$2
+        local=$3
+        offset=0
+        if [ -f "$local" ]; then offset=$(wc -c < "$local"); fi
+        tail -c +$((offset + 1)) "$remote" >> "$local"
+        ;;
+    *) exit 2 ;;
+esac
+"#;
+    let path = bin_dir.join("sftp");
+    std::fs::write(&path, sftp).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_retry_scp(bin_dir: &std::path::Path, counter: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let body = format!(
+        "#!/bin/sh\necho 'tool progress'\nif [ ! -f '{}' ]; then : > '{}'; exit 1; fi\nexit 0\n",
+        counter.display(),
+        counter.display()
+    );
+    let path = bin_dir.join("scp");
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_rsync(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let path = bin_dir.join("rsync");
+    std::fs::write(&path, "#!/bin/sh\necho '>f++++++++ example.txt'\nexit 0\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn write_fake_rsync_with_log(bin_dir: &std::path::Path, log: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho '>f++++++++ example.txt'\nexit 0\n",
+        log.display()
+    );
+    let path = bin_dir.join("rsync");
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_connect_checks_remote_path_and_tools() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let out = env.run_with_path(&bin, &["doctor", "--connect"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("connected"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_reports_same_size_files() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::write(remote.join("same.txt"), "same").unwrap();
+    let local = local_dir.join("same.txt");
+    std::fs::write(&local, "same").unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let out = env.run_with_path(&bin, &["diff", "web", local.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("same"), "stdout: {}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_dry_run_shows_rsync_plan_without_prompting() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_rsync(&bin);
+    let local = env.dir.join("dist");
+    std::fs::create_dir_all(&local).unwrap();
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(&bin, &["--dry-run", "sync", "web", local.to_str().unwrap()]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("sync plan"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_applies_include_exclude_and_sndignore_filters() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    let log = env.dir.join("rsync-args");
+    write_fake_rsync_with_log(&bin, &log);
+    let local = env.dir.join("dist");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join(".sndignore"), "*.tmp\n").unwrap();
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--dry-run",
+            "sync",
+            "--include",
+            "*.txt",
+            "--exclude",
+            "cache/",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let args = std::fs::read_to_string(log).unwrap();
+    assert!(args.contains("--include\n*.txt"), "args: {args}");
+    assert!(args.contains("--exclude\ncache/"), "args: {args}");
+    assert!(args.contains("--exclude-from"), "args: {args}");
+    assert!(args.contains(".sndignore"), "args: {args}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_dry_run_json_is_a_single_machine_readable_document() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_rsync(&bin);
+    let local = env.dir.join("dist");
+    std::fs::create_dir_all(&local).unwrap();
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--dry-run",
+            "--json",
+            "sync",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["data"][0]["target"], "web");
+    assert_eq!(value["data"][0]["changes"][0], ">f++++++++ example.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_execution_json_suppresses_rsync_progress() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_rsync(&bin);
+    let local = env.dir.join("dist");
+    std::fs::create_dir_all(&local).unwrap();
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &["--force", "--json", "sync", "web", local.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["data"][0]["action"], "sync");
+    assert_eq!(value["data"][0]["success"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_verified_upload_replaces_the_final_file_and_emits_clean_json() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("payload.txt");
+    std::fs::write(&local, "new payload").unwrap();
+    std::fs::write(remote.join("payload.txt"), "old payload").unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "--json",
+            "--atomic",
+            "--verify",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["data"][0]["success"], true);
+    assert_eq!(
+        std::fs::read_to_string(remote.join("payload.txt")).unwrap(),
+        "new payload"
+    );
+    assert!(std::fs::read_dir(&remote).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".snd-tmp-")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_upload_validates_the_existing_prefix_before_appending() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_resume_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("payload.txt");
+    std::fs::write(&local, "abcdef").unwrap();
+    std::fs::write(remote.join("payload.txt"), "abc").unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "--resume",
+            "--verify",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(remote.join("payload.txt")).unwrap(),
+        "abcdef"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_upload_rejects_a_mismatched_partial_file() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_resume_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("payload.txt");
+    std::fs::write(&local, "abcdef").unwrap();
+    std::fs::write(remote.join("payload.txt"), "xyz").unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let out = env.run_with_path(
+        &bin,
+        &["--no-check", "--resume", "web", local.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stdout(&out).contains("resume prefix mismatch"),
+        "stdout: {} stderr: {}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.join("payload.txt")).unwrap(),
+        "xyz"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_and_rollback_switch_the_current_symlink() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("local");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("payload.txt");
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    std::fs::write(&local, "release one").unwrap();
+    let first = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "release",
+            "--release",
+            "r1",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+
+    std::fs::write(&local, "release two").unwrap();
+    let second = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "release",
+            "--release",
+            "r2",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert_eq!(
+        std::fs::read_link(remote.join(".snd/current")).unwrap(),
+        std::path::PathBuf::from("releases/r2")
+    );
+    let listed = env.run_with_path(&bin, &["releases", "web"]);
+    assert!(listed.status.success(), "stderr: {}", stderr(&listed));
+    assert!(stdout(&listed).contains("active:   r2"));
+    assert!(stdout(&listed).contains("previous: r1"));
+
+    let rollback = env.run_with_path(&bin, &["rollback", "web"]);
+    assert!(rollback.status.success(), "stderr: {}", stderr(&rollback));
+    assert_eq!(
+        std::fs::read_link(remote.join(".snd/current")).unwrap(),
+        std::path::PathBuf::from("releases/r1")
+    );
+
+    let selected = env.run_with_path(&bin, &["rollback", "--to", "r2", "web"]);
+    assert!(selected.status.success(), "stderr: {}", stderr(&selected));
+    assert_eq!(
+        std::fs::read_link(remote.join(".snd/current")).unwrap(),
+        std::path::PathBuf::from("releases/r2")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_send_rollback_restores_the_overwritten_file() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("out");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("ManaReport.jar");
+    let deployed = remote.join("ManaReport.jar");
+    std::fs::write(&deployed, "old jar").unwrap();
+    std::fs::write(&local, "new jar").unwrap();
+    env.run(&["add", "dev-proxy", "u@h", remote.to_str().unwrap()]);
+
+    let send = env.run_with_path(&bin, &["--no-check", "dev-proxy", local.to_str().unwrap()]);
+    assert!(send.status.success(), "stderr: {}", stderr(&send));
+    assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "new jar");
+    assert!(
+        !remote.join(".snd").exists(),
+        "direct-send metadata must not be stored in the destination"
+    );
+
+    std::fs::write(&local, "newest jar").unwrap();
+    let second_send =
+        env.run_with_path(&bin, &["--no-check", "dev-proxy", local.to_str().unwrap()]);
+    assert!(
+        second_send.status.success(),
+        "stderr: {}",
+        stderr(&second_send)
+    );
+    assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "newest jar");
+
+    let rollback = env.run_with_path(&bin, &["rollback", "dev-proxy"]);
+    assert!(
+        rollback.status.success(),
+        "stdout: {} stderr: {}",
+        stdout(&rollback),
+        stderr(&rollback)
+    );
+    assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "new jar");
+    assert!(
+        stdout(&rollback).contains("restored direct send"),
+        "stdout: {}",
+        stdout(&rollback)
+    );
+
+    let rollback_again = env.run_with_path(&bin, &["rollback", "dev-proxy"]);
+    assert!(
+        rollback_again.status.success(),
+        "stdout: {} stderr: {}",
+        stdout(&rollback_again),
+        stderr(&rollback_again)
+    );
+    assert_eq!(std::fs::read_to_string(&deployed).unwrap(), "old jar");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_send_rollback_restores_a_directory() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_parent = env.dir.join("local");
+    let local = local_parent.join("plugins");
+    let deployed = remote.join("plugins");
+    std::fs::create_dir_all(&deployed).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(deployed.join("plugin.jar"), "old plugin").unwrap();
+    std::fs::write(local.join("plugin.jar"), "new plugin").unwrap();
+    env.run(&["add", "proxy", "u@h", remote.to_str().unwrap()]);
+
+    let send = env.run_with_path(&bin, &["--no-check", "proxy", local.to_str().unwrap()]);
+    assert!(send.status.success(), "stderr: {}", stderr(&send));
+    assert_eq!(
+        std::fs::read_to_string(deployed.join("plugin.jar")).unwrap(),
+        "new plugin"
+    );
+
+    let rollback = env.run_with_path(&bin, &["rollback", "proxy"]);
+    assert!(rollback.status.success(), "stderr: {}", stderr(&rollback));
+    assert_eq!(
+        std::fs::read_to_string(deployed.join("plugin.jar")).unwrap(),
+        "old plugin"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_send_rollback_removes_a_new_destination() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local_dir = env.dir.join("out");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let local = local_dir.join("new.jar");
+    std::fs::write(&local, "new file").unwrap();
+    env.run(&["add", "proxy", "u@h", remote.to_str().unwrap()]);
+
+    let send = env.run_with_path(&bin, &["--no-check", "proxy", local.to_str().unwrap()]);
+    assert!(send.status.success(), "stderr: {}", stderr(&send));
+    assert!(remote.join("new.jar").exists());
+
+    let rollback = env.run_with_path(&bin, &["rollback", "proxy"]);
+    assert!(rollback.status.success(), "stderr: {}", stderr(&rollback));
+    assert!(!remote.join("new.jar").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_send_can_rollback_only_one_file_from_a_batch() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_copy_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    let local = env.dir.join("out");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    for name in ["first.jar", "second.jar", "third.jar"] {
+        std::fs::write(remote.join(name), format!("old {name}")).unwrap();
+        std::fs::write(local.join(name), format!("new {name}")).unwrap();
+    }
+    env.run(&["add", "proxy", "u@h", remote.to_str().unwrap()]);
+
+    let send = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "proxy",
+            local.join("first.jar").to_str().unwrap(),
+            local.join("second.jar").to_str().unwrap(),
+            local.join("third.jar").to_str().unwrap(),
+        ],
+    );
+    assert!(send.status.success(), "stderr: {}", stderr(&send));
+
+    let history = env.run_with_path(&bin, &["history", "proxy"]);
+    assert!(history.status.success(), "stderr: {}", stderr(&history));
+    assert!(stdout(&history).contains("first.jar"));
+    assert!(stdout(&history).contains("second.jar"));
+    assert!(stdout(&history).contains("third.jar"));
+
+    let filtered = env.run_with_path(&bin, &["history", "proxy", "first.jar"]);
+    assert!(filtered.status.success(), "stderr: {}", stderr(&filtered));
+    assert!(stdout(&filtered).contains("first.jar"));
+    assert!(!stdout(&filtered).contains("second.jar"));
+
+    let rollback = env.run_with_path(&bin, &["rollback", "proxy", "first.jar"]);
+    assert!(rollback.status.success(), "stderr: {}", stderr(&rollback));
+    assert_eq!(
+        std::fs::read_to_string(remote.join("first.jar")).unwrap(),
+        "old first.jar"
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.join("second.jar")).unwrap(),
+        "new second.jar"
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.join("third.jar")).unwrap(),
+        "new third.jar"
+    );
+
+    let remaining = env.run_with_path(&bin, &["rollback", "proxy"]);
+    assert!(remaining.status.success(), "stderr: {}", stderr(&remaining));
+    assert_eq!(
+        std::fs::read_to_string(remote.join("second.jar")).unwrap(),
+        "old second.jar"
+    );
+    assert_eq!(
+        std::fs::read_to_string(remote.join("third.jar")).unwrap(),
+        "old third.jar"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn transfer_retries_are_reported_in_json() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    let counter = env.dir.join("attempted");
+    write_retry_scp(&bin, &counter);
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "--json",
+            "--retries",
+            "1",
+            "web",
+            "missing-local",
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["data"][0]["attempts"], 2);
+    assert_eq!(value["data"][0]["success"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn transfer_audit_log_is_json_lines_with_a_schema_version() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let audit = env.dir.join("audit/operations.jsonl");
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "--audit-log",
+            audit.to_str().unwrap(),
+            "web",
+            "missing-local",
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let line = std::fs::read_to_string(&audit).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["command"], "send");
+    assert_eq!(value["ok"], true);
+
+    let viewed = env.run(&["audit", audit.to_str().unwrap()]);
+    assert!(viewed.status.success(), "stderr: {}", stderr(&viewed));
+    assert!(stdout(&viewed).contains("send"));
+    assert!(stdout(&viewed).contains("OK"));
+    assert!(stdout(&viewed).contains("web"));
+}
+
+#[cfg(unix)]
+#[test]
+fn progress_summary_reports_bytes_and_duration() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let local = env.dir.join("payload.bin");
+    std::fs::write(&local, vec![0_u8; 2048]).unwrap();
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &[
+            "--no-check",
+            "--no-backup",
+            "--progress",
+            "web",
+            local.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("2.00 KB"), "stdout: {}", stdout(&out));
+    assert!(stdout(&out).contains(" in "), "stdout: {}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn download_json_is_not_prefixed_by_human_progress() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    env.run(&["add", "web", "u@h", "/srv"]);
+
+    let out = env.run_with_path(&bin, &["--no-check", "--json", "get", "web", "payload.txt"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["data"][0]["action"], "download");
+    assert_eq!(value["data"][0]["success"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_group_send_prints_a_result_summary() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    env.run(&["add", "web", "u@h1", "/srv/web"]);
+    env.run(&["add", "api", "u@h2", "/srv/api"]);
+    env.run(&["add-group", "prod", "web", "api"]);
+
+    let out = env.run_with_path(
+        &bin,
+        &["--no-check", "--jobs", "2", "prod", "missing-local"],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("2 succeeded, 0 failed"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn completion_does_not_execute_host_text_in_the_local_shell() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let marker = env.dir.join("completion-injected");
+    let host = format!("ignored; touch {}; #", marker.display());
+    env.run(&["add", "web", &host, remote.to_str().unwrap()]);
+
+    let _ = env.run_complete_with_path(&bin, &["cat", "web", ""]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    assert!(
+        !marker.exists(),
+        "completion executed configured host text in the local shell"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cat_and_delete_support_hyphen_and_pipe_filenames() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let remote = env.dir.join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let hyphen = remote.join("-leading.txt");
+    let pipe = remote.join("a|b");
+    std::fs::write(&hyphen, "hyphen content\n").unwrap();
+    std::fs::write(&pipe, "pipe content\n").unwrap();
+    env.run(&["add", "web", "u@h", remote.to_str().unwrap()]);
+
+    let cat = env.run_with_path(&bin, &["cat", "web", "--", "-leading.txt"]);
+    assert!(cat.status.success(), "stderr: {}", stderr(&cat));
+    assert!(stdout(&cat).contains("hyphen content"));
+
+    let delete =
+        env.run_with_path_and_input(&bin, &["delete", "web", "--", "-leading.txt", "a|b"], "y\n");
+    assert!(delete.status.success(), "stderr: {}", stderr(&delete));
+    assert!(!hyphen.exists(), "hyphen-prefixed file was not deleted");
+    assert!(!pipe.exists(), "pipe-containing file was not deleted");
+    assert!(
+        stdout(&delete).contains(&pipe.display().to_string()),
+        "delete did not retain the original pipe-containing pathname: {}",
+        stdout(&delete)
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn glob_path_fans_out_to_each_matching_dir() {
     let env = TestEnv::new();
@@ -1732,6 +2875,30 @@ fn glob_path_fans_out_to_each_matching_dir() {
 
 #[cfg(unix)]
 #[test]
+fn glob_path_escapes_remote_shell_metacharacters() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    let remote = env.dir.join("targets");
+    std::fs::create_dir_all(remote.join("app-one")).unwrap();
+    let marker = env.dir.join("glob-injected");
+    let pattern = format!("{}/app-*; touch {}; #", remote.display(), marker.display());
+    env.run(&["add", "app", "user@h", &pattern]);
+
+    let out = env.run_with_path(&bin, &["-f", "app", "missing-local-file-xyz"]);
+
+    assert!(
+        !out.status.success(),
+        "escaped composite path should not match"
+    );
+    assert!(
+        !marker.exists(),
+        "glob path executed shell metacharacters remotely"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn glob_path_no_match_is_an_error() {
     let env = TestEnv::new();
     let bin = env.dir.join("fakebin");
@@ -1751,6 +2918,31 @@ fn glob_path_no_match_is_an_error() {
     );
     // Nothing was sent.
     assert!(!stdout(&out).contains("scp "), "stdout: {}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_path_ignores_matching_regular_files() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("targets");
+    std::fs::create_dir_all(remote.join("app-dir")).unwrap();
+    std::fs::write(remote.join("app-file"), "not a destination").unwrap();
+
+    let pattern = format!("{}/app-*", remote.display());
+    env.run(&["add", "app", "user@h", &pattern]);
+    let out = env.run_with_path(&bin, &["-f", "app", "missing-local-file-xyz"]);
+    let printed = stdout(&out);
+
+    assert!(printed.contains("app-dir"), "stdout: {printed}");
+    assert!(!printed.contains("app-file"), "stdout: {printed}");
+    assert!(
+        stderr(&out).contains("resolved to 1 path(s)"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 #[cfg(unix)]

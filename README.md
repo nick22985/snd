@@ -32,6 +32,265 @@ COMPLETE=fish snd | source
 
 ## Usage
 
+### Plan and automate safely
+
+Every upload, download, delete, and sync operation supports `--dry-run`. For
+uploads, `snd plan` is a shorter dedicated form that resolves groups, aliases,
+relative overrides, and wildcard paths without running `scp`:
+
+```bash
+snd plan prod build.jar
+snd --dry-run get prod build.jar
+snd --dry-run delete prod old.jar
+snd --dry-run sync prod ./dist
+```
+
+Multi-target operations finish with a success/failure summary. Use `--jobs N`
+to fan work out concurrently, `--fail-fast` to stop scheduling after a failure,
+and `--retries N` for transient transfer failures.
+
+```bash
+snd --jobs 4 --retries 2 prod build.jar
+```
+
+Add `--progress` for start/completion timing and native transfer progress. Use
+`--audit-log FILE` to append schema-versioned JSON Lines records for completed
+operations:
+
+```bash
+snd --progress --audit-log .snd-audit.jsonl prod build.jar
+snd audit .snd-audit.jsonl
+snd audit .snd-audit.jsonl --last 50 --command send --failed
+```
+
+`--json` provides machine-readable output for plans, transfer summaries,
+`doctor`, `find`, `diff`, and resolved configuration.
+
+### Reliable transfer options
+
+The following typed options are passed safely to the underlying SSH transfer:
+
+- `--preserve` — preserve file modes and timestamps.
+- `-C` / `--compress` — enable SSH compression.
+- `--limit KBIT/S` — cap transfer bandwidth.
+- `-i` / `--identity KEY_FILE` — select an SSH identity.
+- `-F` / `--ssh-config FILE` — use an alternate SSH config.
+- `--atomic` — upload regular files to temporary names and rename them into
+  place only after successful transfer/verification.
+- `--verify` — compare SHA-256 after transferring regular files. The remote
+  needs `sha256sum` or `shasum`.
+- `--resume` — resume partial regular-file transfers using SFTP.
+
+Before resuming, `snd` compares the existing partial file with the matching
+prefix of the source. A mismatch is rejected instead of producing a corrupted
+result. Atomic and resumable uploads also hold a remote destination lock while
+the transfer is active; resumable downloads use a local lock.
+Safe resume therefore requires `sha256sum` or `shasum` on the remote, just like
+`--verify`.
+
+These compose, so a guarded deployment can be run as:
+
+```bash
+snd --atomic --verify --jobs 4 prod build.jar
+```
+
+### Undo a direct send
+
+Direct sends automatically snapshot the remote files or directories they are
+about to replace. The snapshot also records destinations that did not exist,
+so rollback removes newly created files instead of leaving them behind:
+
+```bash
+snd dev-proxy ./out/ManaReport.jar
+snd rollback dev-proxy             # restore the previous ManaReport.jar
+snd rollback dev-proxy ManaReport.jar
+```
+
+One snapshot covers the whole send, including sends with multiple inputs. Pass
+one or more destination names to restore only those files:
+
+```bash
+snd proxy first.jar second.jar third.jar
+snd rollback proxy first.jar       # second.jar and third.jar stay deployed
+snd rollback proxy                 # restore the remaining two files
+```
+
+A named rollback searches backward for the newest unused snapshot containing
+that filename, so it also works when the files were sent in separate commands.
+Only the restored entries are consumed. A full rollback consumes every
+remaining entry in the latest snapshot, so running it again restores the state
+before the preceding send. Failed sends attempt an immediate restore and are
+not added to the history. The newest 10 successful send snapshots are kept per
+remote path by default; use `--backup-keep N` to change that (`0` keeps all),
+or `--no-backup` when rollback storage is not wanted. Metadata and payloads
+live on the remote host under
+`$HOME/.local/share/snd/targets/<destination-hash>/backups`. On a fresh
+installation, rollback metadata starts there immediately; it is not first
+created inside the destination. Nothing is added to a watched plugin directory
+except the files being deployed.
+
+For example, if an added path resolves to `/plugins`, the deployed JAR and its
+rollback snapshot are kept separate:
+
+```text
+/plugins/ManaReport.jar                                  # deployed file
+$HOME/.local/share/snd/targets/<hash>/backups/...        # rollback data
+```
+
+There is no `/plugins/.snd` directory.
+
+Inspect every available transaction, or only the history for one destination
+name, without downloading the backed-up payloads:
+
+```bash
+snd history dev-proxy
+snd history dev-proxy ManaReport.jar
+snd --json history dev-proxy
+```
+
+### Compare and synchronize
+
+`snd diff` compares local files with the names they would have at each remote
+target. By default it uses file sizes; `--hash` performs a SHA-256 comparison.
+
+```bash
+snd diff prod ./build/app.jar
+snd diff --hash prod ./build/app.jar
+```
+
+`snd sync` previews and then applies an `rsync` directory synchronization. It
+requires `rsync` locally and remotely. Remote deletion is opt-in and always
+shown in the preview before confirmation:
+
+```bash
+snd sync web ./dist
+snd sync --delete web ./dist
+snd --dry-run sync --delete prod ./dist
+```
+
+Sync supports ordered include/exclude filters and automatically loads
+`LOCAL_DIR/.sndignore` as an rsync exclude file when present:
+
+```bash
+snd sync --include '*.js' --exclude 'cache/' web ./dist
+snd sync --ignore-file ./deploy.ignore web ./dist
+snd sync --no-ignore web ./dist
+```
+
+Interrupted syncs retain reusable partial files under `.snd-partial`.
+
+### Versioned releases and rollback
+
+`snd release` uploads regular files into an isolated, versioned directory,
+verifies every file, writes a completion marker, and then switches
+`<target>/.snd/current`. Applications should serve or launch through that
+symlink for activation and rollback to take effect.
+
+```bash
+snd release --release 2026-07-15 web ./dist/app.jar ./dist/config.json
+snd releases web
+snd rollback --release web       # activate the recorded previous release
+snd rollback --to 2026-07-15 web
+```
+
+The previous pointer is updated during both activation and rollback, so a
+second `snd rollback --release` toggles back. Without `--release` or `--to`,
+rollback first restores the latest direct send and falls back to the previous
+versioned release when no direct-send snapshot exists. `--keep N` controls
+release retention (default 5), while active and previous releases are always
+protected. Release names are never reused unless `--resume` is explicitly
+supplied for an incomplete release.
+
+### Deployment manifests
+
+Named operations can be stored in `snd.deploy.toml` and applied together or by
+name. File paths are resolved relative to the manifest:
+
+```toml
+version = 1
+
+[deploy.web]
+target = "prod"
+files = ["dist/app.jar", "dist/config.json"]
+release = true
+atomic = true
+verify = true
+keep = 5
+
+[deploy.assets]
+target = "cdn"
+files = ["dist/assets.tar"]
+path = "uploads"
+```
+
+```bash
+snd apply
+snd apply ./deploy/production.toml --name web
+snd --dry-run --json apply --name web
+```
+
+### Project configuration
+
+`snd init` creates a versioned `.snd.toml` in the current directory. The
+nearest project configuration is layered over the global config, allowing a
+repository to share deployment aliases without copying personal SSH settings.
+
+```bash
+snd init
+snd config show --resolved              # merged effective TOML
+snd --json config show --resolved       # merged effective JSON
+snd config --paths      # show global/project config locations
+```
+
+Use `--local` with configuration mutations to write the nearest project file
+instead of the global configuration:
+
+```bash
+snd --local add staging deploy@staging /srv/app
+snd --local add-path staging logs /var/log/app
+snd --local add-group test staging
+```
+
+Configuration utilities validate semantic references after parsing and open
+the selected file with `$VISUAL`, `$EDITOR`, or `vi`:
+
+```bash
+snd config validate
+snd config edit
+snd --local config edit
+```
+
+Global configuration writes are atomic and retain the previous file as
+`servers.toml.bak`.
+
+### JSON and exit codes
+
+Machine output is wrapped in a stable envelope:
+
+```json
+{
+  "schema_version": 1,
+  "command": "send",
+  "ok": true,
+  "data": []
+}
+```
+
+Exit code `0` means success, `1` means an operation failed or `diff` found a
+difference, and `2` is reserved by the CLI parser for invalid usage. Human
+prompts and transfer diagnostics go to stderr when `--json` is active.
+
+### Completion cache
+
+Inspect or clear the asynchronous remote-completion cache without finding its
+platform-specific directory manually:
+
+```bash
+snd cache show
+snd cache clear
+snd cache clear --older-than 7
+```
+
 ### Send files
 
 ```bash
@@ -96,6 +355,18 @@ Flags:
 - `--no-check` — skip the SSH stat entirely (faster on slow links, no prompt).
 
 The stat call reuses your existing SSH multiplexing socket (`~/.ssh/snd-...`), so it doesn't add a fresh connection.
+
+### Diagnose connectivity
+
+`snd doctor` checks cached SSH resolution. `snd doctor --connect` additionally
+connects to every server, shows effective SSH host/user/port information,
+checks that the default path exists and is writable, verifies required remote
+tools, and reports filesystem capacity.
+
+```bash
+snd doctor --connect
+snd --json doctor --connect
+```
 
 ### List a remote directory
 
@@ -168,6 +439,10 @@ snd get -r web stale-build
 
 Bare names resolve under the server's path; anything with `/` or `~` is used
 verbatim. A positional directory changes the base for the files that follow.
+Remote wildcard file operands are rejected because their expanded local
+destinations cannot be checked safely for overwrites; request explicit files.
+Escape a glob character with a backslash when it is part of the literal remote
+filename (for example, `snd get web 'report\[1\].txt'`).
 
 When the target is a group, downloads land in `<dest>/<server-name>/` so files from each member don't collide:
 
@@ -176,6 +451,9 @@ snd get -o ./dl prod build.tar.gz
 # → ./dl/web/build.tar.gz
 # → ./dl/api/build.tar.gz
 ```
+
+If a group references multiple paths on the same server, the path alias is
+added to the directory name (for example, `web-default/` and `web-logs/`).
 
 Before scp runs, `snd get` checks each local destination and lists any existing files (size, age, full path) so you can confirm before they're overwritten:
 
@@ -251,6 +529,9 @@ snd delete -r web stale-build/
 ```
 
 `snd delete` always stats each target first, lists what it found (size, modified time, full remote path), and prompts before running `rm` on the remote.
+
+For remote names beginning with `-`, place `--` before the filename (for
+example, `snd cat web -- -notes.txt` or `snd delete web -- -notes.txt`).
 
 Safeguards:
 

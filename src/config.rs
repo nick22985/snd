@@ -4,6 +4,12 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshResolved {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,12 +52,24 @@ pub struct Group {
     pub targets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, Group>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_SCHEMA_VERSION,
+            servers: BTreeMap::new(),
+            groups: BTreeMap::new(),
+        }
+    }
 }
 
 pub type Servers = BTreeMap<String, Server>;
@@ -124,36 +142,179 @@ pub fn config_path() -> PathBuf {
     config_dir().join("servers.toml")
 }
 
+pub fn project_config_path() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(".snd.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+pub fn project_config_path_for_write() -> PathBuf {
+    project_config_path().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".snd.toml")
+    })
+}
+
 fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("snd")
 }
 
-pub fn load_config_strict() -> Result<Config, String> {
-    let path = config_path();
-    match fs::read_to_string(&path) {
-        Ok(content) => toml::from_str::<Config>(&content)
-            .map_err(|e| format!("failed to parse {}: {e}", path.display())),
-        Err(_) => Ok(Config::default()),
+pub fn load_config_path(path: &std::path::Path) -> Result<Config, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let cfg = toml::from_str::<Config>(&content)
+                .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+            if cfg.version > CONFIG_SCHEMA_VERSION {
+                return Err(format!(
+                    "{} uses config schema {}, but this snd supports up to {}",
+                    path.display(),
+                    cfg.version,
+                    CONFIG_SCHEMA_VERSION
+                ));
+            }
+            Ok(cfg)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(format!("failed to read {}: {e}", path.display())),
     }
 }
 
+pub fn load_config_strict() -> Result<Config, String> {
+    load_config_path(&config_path())
+}
+
+pub fn load_project_config_strict() -> Result<(PathBuf, Config), String> {
+    let path = project_config_path().ok_or_else(|| {
+        "no project .snd.toml found; run 'snd init' before using --local".to_string()
+    })?;
+    let config = load_config_path(&path)?;
+    Ok((path, config))
+}
+
+pub fn load_effective_config_strict() -> Result<Config, String> {
+    let mut cfg = load_config_strict()?;
+    if let Some(path) = project_config_path() {
+        let project = load_config_path(&path)?;
+        cfg.servers.extend(project.servers);
+        cfg.groups.extend(project.groups);
+    }
+    Ok(cfg)
+}
+
 pub fn load_config() -> Config {
-    load_config_strict().unwrap_or_default()
+    load_effective_config_strict().unwrap_or_default()
 }
 
 pub fn load_servers() -> Servers {
-    load_config().servers
+    load_effective_config_strict().unwrap_or_default().servers
 }
 
 pub fn save_config(cfg: &Config) -> io::Result<()> {
     let path = config_path();
+    save_config_path(cfg, &path, true)
+}
+
+pub fn save_config_path(cfg: &Config, path: &std::path::Path, private: bool) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let content = toml::to_string_pretty(cfg).map_err(io::Error::other)?;
-    fs::write(&path, content)
+    let mut cfg = cfg.clone();
+    cfg.version = CONFIG_SCHEMA_VERSION;
+    let content = toml::to_string_pretty(&cfg).map_err(io::Error::other)?;
+    let temp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
+    let backup = path.with_extension("toml.bak");
+    if path.exists() {
+        fs::copy(path, &backup)?;
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    fs::write(&temp, content)?;
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    fs::rename(temp, path)
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(char::is_control)
+}
+
+pub fn validate_config(cfg: &Config) -> Vec<String> {
+    let mut errors = Vec::new();
+    if cfg.version != CONFIG_SCHEMA_VERSION {
+        errors.push(format!(
+            "schema version is {}, expected {}",
+            cfg.version, CONFIG_SCHEMA_VERSION
+        ));
+    }
+    for (alias, server) in &cfg.servers {
+        if !valid_name(alias) {
+            errors.push(format!("invalid server alias '{alias}'"));
+        }
+        if cfg.groups.contains_key(alias) {
+            errors.push(format!("'{alias}' is both a server and a group"));
+        }
+        if server.host.trim().is_empty() {
+            errors.push(format!("server '{alias}' has an empty host"));
+        }
+        if server.paths.is_empty() {
+            errors.push(format!("server '{alias}' has no paths"));
+        }
+        if !server.paths.contains_key(&server.default) {
+            errors.push(format!(
+                "server '{alias}' default path alias '{}' does not exist",
+                server.default
+            ));
+        }
+        for (path_alias, path) in &server.paths {
+            if !valid_name(path_alias) {
+                errors.push(format!(
+                    "server '{alias}' has invalid path alias '{path_alias}'"
+                ));
+            }
+            if path.trim().is_empty() {
+                errors.push(format!(
+                    "server '{alias}' path alias '{path_alias}' is empty"
+                ));
+            }
+        }
+    }
+    for (group, definition) in &cfg.groups {
+        if !valid_name(group) {
+            errors.push(format!("invalid group name '{group}'"));
+        }
+        if definition.targets.is_empty() {
+            errors.push(format!("group '{group}' has no targets"));
+        }
+        for target in &definition.targets {
+            if let Err(e) = canonicalize_group_target(cfg, target) {
+                errors.push(format!("group '{group}': {e}"));
+            }
+        }
+    }
+    errors
 }
 
 #[cfg(test)]
@@ -214,7 +375,11 @@ mod tests {
                 targets: vec!["web".to_string(), "db:root".to_string()],
             },
         );
-        let cfg = Config { servers, groups };
+        let cfg = Config {
+            servers,
+            groups,
+            ..Config::default()
+        };
 
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         assert!(serialized.contains("[servers.web]"));
@@ -263,6 +428,7 @@ targets = ["web", "db:root"]
         Config {
             servers: s,
             groups: BTreeMap::new(),
+            ..Config::default()
         }
     }
 
@@ -357,6 +523,7 @@ targets = ["web", "db:root"]
         let cfg = Config {
             servers: Servers::new(),
             groups: BTreeMap::new(),
+            ..Config::default()
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         assert!(!s.contains("[groups"), "expected no groups header: {s}");
