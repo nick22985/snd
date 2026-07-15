@@ -76,6 +76,18 @@ impl TestEnv {
     fn config_file(&self) -> PathBuf {
         self.dir.join("snd").join("servers.toml")
     }
+
+    fn run_with_path(&self, extra_path: &std::path::Path, args: &[&str]) -> Output {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{existing}", extra_path.display());
+        Command::new(env!("CARGO_BIN_EXE_snd"))
+            .env("XDG_CONFIG_HOME", &self.dir)
+            .env("PATH", path)
+            .env_remove("COMPLETE")
+            .args(args)
+            .output()
+            .expect("spawn snd binary")
+    }
 }
 
 impl Drop for TestEnv {
@@ -1140,6 +1152,73 @@ fn get_unknown_target_errors() {
     assert!(stderr(&out).contains("Unknown server or group"));
 }
 
+#[test]
+fn find_unknown_target_errors() {
+    let env = TestEnv::new();
+    let out = env.run(&["find", "nope", "essentials"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("Unknown server or group"));
+}
+
+#[test]
+fn find_without_pattern_errors() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["find", "web"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("No search pattern"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn find_consumes_path_alias_leaving_no_pattern_errors() {
+    // `find web logs` treats "logs" as the path-alias, so no pattern remains.
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log/web"]);
+    let out = env.run(&["find", "web", "logs"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("No search pattern"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn search_alias_is_accepted() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&["search", "web"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("No search pattern"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn completion_find_target_offers_servers() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run_complete(&["find", ""]);
+    assert!(out.contains("web"), "completion: {out}");
+}
+
+#[test]
+fn completion_find_offers_path_alias_after_target() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    env.run(&["add-path", "web", "logs", "/var/log"]);
+    let out = env.run_complete(&["find", "web", ""]);
+    assert!(out.contains("logs"), "completion: {out}");
+    assert!(out.contains("default"), "completion: {out}");
+}
+
 fn make_home_with_ssh(config: &str) -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let home = std::env::temp_dir().join(format!("snd-ssh-home-{}-{n}", std::process::id()));
@@ -1423,5 +1502,163 @@ fn completion_ambiguous_path_alias_not_offered() {
             .iter()
             .any(|l| l.starts_with("shared\t") || *l == "shared"),
         "completion: {out}"
+    );
+}
+
+/// Write a fake `ssh`/`scp` pair into `bin_dir`. The fake `ssh` ignores all
+/// options and the host, then runs the remote command (its last argument)
+/// through the local shell — so a glob-expansion command actually expands
+/// against local directories the test created. The fake `scp` just succeeds.
+#[cfg(unix)]
+fn write_fake_ssh_tools(bin_dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    // `for last; do :; done` leaves `last` holding the final positional arg
+    // (the remote command); run it locally so `for p in <glob>` expands here.
+    let ssh = "#!/bin/sh\nfor last; do :; done\nsh -c \"$last\"\n";
+    let scp = "#!/bin/sh\nexit 0\n";
+    for (name, body) in [("ssh", ssh), ("scp", scp)] {
+        let p = bin_dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_path_fans_out_to_each_matching_dir() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("instances");
+    for id in ["app-1_a1b2c3d4", "app-2_e5f6a7b8", "app-3_9c8d7e6f"] {
+        std::fs::create_dir_all(remote.join(id).join("plugins")).unwrap();
+    }
+    // Non-matching dirs: wrong prefix, and a match with no plugins subdir.
+    std::fs::create_dir_all(remote.join("other-1_11223344").join("plugins")).unwrap();
+    std::fs::create_dir_all(remote.join("app-9_nodir")).unwrap();
+
+    let pattern = format!("{}/app-*_*/plugins", remote.display());
+    env.run(&["add", "app", "user@h", "/unused"]);
+    env.run(&["add-path", "app", "node", &pattern]);
+
+    // -f skips the fan-out confirm; the missing local file means no stat ssh.
+    let out = env.run_with_path(&bin, &["-f", "app", "node", "missing-local-file-xyz"]);
+    let so = stdout(&out);
+    let se = stderr(&out);
+
+    // Expansion is reported and lists the matching dirs.
+    assert!(se.contains("resolved to 3 path(s)"), "stderr: {se}");
+
+    // One scp per matching plugins dir — and none to the literal pattern.
+    for id in ["app-1_a1b2c3d4", "app-2_e5f6a7b8", "app-3_9c8d7e6f"] {
+        let expected = format!("user@h:{}/{id}/plugins", remote.display());
+        assert!(so.contains(&expected), "missing scp to {id}\nstdout: {so}");
+    }
+    assert!(
+        !so.contains('*'),
+        "should not scp to the literal glob: {so}"
+    );
+    assert!(!so.contains("other-1"), "must not match wrong prefix: {so}");
+    assert!(
+        !so.contains("app-9"),
+        "must skip match without plugins dir: {so}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn glob_path_no_match_is_an_error() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    std::fs::create_dir_all(env.dir.join("services")).unwrap();
+
+    let pattern = format!("{}/services/absent-*/plugins", env.dir.display());
+    env.run(&["add", "app", "user@h", "/unused"]);
+    env.run(&["add-path", "app", "gone", &pattern]);
+
+    let out = env.run_with_path(&bin, &["-f", "app", "gone", "missing-local-file-xyz"]);
+    assert!(!out.status.success(), "should fail when nothing matches");
+    assert!(
+        stderr(&out).contains("matched no directories"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    // Nothing was sent.
+    assert!(!stdout(&out).contains("scp "), "stdout: {}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn cat_prints_remote_file_contents() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("app");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(remote.join("config.yml"), "database.host: 10.0.0.5\n").unwrap();
+
+    env.run(&["add", "proxy", "user@h", remote.to_str().unwrap()]);
+
+    // Bare name resolves under the server path.
+    let out = env.run_with_path(&bin, &["cat", "proxy", "config.yml"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("database.host: 10.0.0.5"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cat_no_files_errors() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+    env.run(&["add", "proxy", "user@h", "/app"]);
+    let out = env.run_with_path(&bin, &["cat", "proxy"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("No files specified"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_lists_remote_directory() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("instances");
+    std::fs::create_dir_all(remote.join("app-1_a1b2c3d4")).unwrap();
+    std::fs::create_dir_all(remote.join("app-2_e5f6a7b8")).unwrap();
+
+    env.run(&["add", "app", "user@h", remote.to_str().unwrap()]);
+    let out = env.run_with_path(&bin, &["ls", "app"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let so = stdout(&out);
+    assert!(so.contains("app-1_a1b2c3d4"), "stdout: {so}");
+    assert!(so.contains("app-2_e5f6a7b8"), "stdout: {so}");
+}
+
+#[test]
+fn ls_without_target_still_lists_config() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "user@h", "/var/www"]);
+    let out = env.run(&["ls"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    // Prints the configured server, not a remote listing.
+    assert!(stdout(&out).contains("web"), "stdout: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("/var/www"),
+        "stdout: {}",
+        stdout(&out)
     );
 }

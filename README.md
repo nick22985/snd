@@ -92,6 +92,42 @@ Flags:
 
 The stat call reuses your existing SSH multiplexing socket (`~/.ssh/snd-...`), so it doesn't add a fresh connection.
 
+### List a remote directory
+
+`snd ls <server>` runs `ls -lhA` on the server's configured path over SSH — handy
+for peeking at a folder (e.g. the current rotating instance dirs and their IDs)
+before you send. With no argument, `snd ls` still lists your configured servers
+and groups.
+
+```bash
+snd ls                       # your servers + groups (same as `snd list`)
+snd ls app                   # ls the server's default path
+snd ls app logs              # ls a named path-alias
+snd ls app node              # a glob path lists each matching dir
+snd ls -p '/srv/app/instances' app   # one-off path
+```
+
+A group lists every member, labelled per server. Glob paths and `-p` resolve the
+same way as everywhere else.
+
+### Print remote file contents
+
+`snd cat <server> <files...>` prints remote files to stdout (`cat` over SSH) —
+no download, pipe- and redirect-friendly:
+
+```bash
+snd cat prod config.yml                 # bare name → under the server path
+snd cat prod /etc/nginx/nginx.conf      # /-or-~ path → verbatim
+snd cat prod logs latest.log            # from a path-alias
+snd cat -p /var/log prod app.log        # one-off path override
+snd cat prod config.yml | grep host     # it's just stdout
+```
+
+Paths resolve exactly like `get`/`delete` (bare names under the server path,
+anything with `/` or `~` verbatim, `-p` overrides, globs expand). For a group,
+each server's output is printed under a `[server] host:path` header; a single
+server is a clean passthrough with no header.
+
 ### Get files from a server
 
 ```bash
@@ -134,6 +170,49 @@ Overwrite local files? [y/N]
 ```
 
 `-f` skips the prompt, `--no-check` skips the local check entirely.
+
+### Search a server
+
+Not sure which folder a jar landed in? `snd find` runs a search over SSH and prints where things are, so you can copy a path straight into `snd -p`.
+
+```bash
+snd find <server-or-group> [path-alias] <pattern>
+snd search ...                                    # alias
+```
+
+By default it matches **file names**, case-insensitively, as a substring — so `essentials` finds `EssentialsX.jar` anywhere under the base:
+
+```
+$ snd find prod essentials
+[prod] deploy@10.0.0.1:/opt/app — 2 match(es):
+  /opt/app/plugins/EssentialsX.jar             8.2 MB  2026-07-01 09:14:02 +0000
+  /opt/app/backup/EssentialsX-old.jar          7.9 MB  2026-05-20 22:03:11 +0000
+```
+
+The search base is the server's configured path — the same resolution as everything else, so a path-alias narrows it and `-p` overrides it:
+
+```bash
+snd find prod plugins essentials     # search under the 'plugins' path-alias
+snd find -p / prod worldedit         # sweep the whole server
+snd find -p ./logs prod error        # relative to the configured base
+```
+
+Flags:
+
+- **`-e` / `--regex`** — treat the pattern as an extended regex instead of a substring. It matches anywhere in the path unless you anchor it with `^` / `$`.
+- **`--case-sensitive`** — turn off the default case-insensitivity.
+- **`-d` / `--depth N`** — limit a filename search to `N` directory levels below the base (handy with `-p /`).
+- **`-g` / `--grep`** — search **file contents** instead of names (recursive `grep`, skips binaries). Output is `path:line:content`:
+
+```
+$ snd find -g prod "database.host"
+[prod] deploy@10.0.0.1:/opt/app
+  /opt/app/config.yml:12:  database.host: 10.0.0.5
+```
+
+`-e` and `--case-sensitive` apply to `-g` too (extended regex / case-sensitive grep). A plain pattern (no `-e`) is matched as a fixed string, so `.` and other regex characters are literal.
+
+If the first positional after the server matches a path-alias it's consumed as the base; quote or use `-p` if you actually want to search for that word. Searching a **group** runs the search on every member and labels the results per server.
 
 ### Delete remote files
 
@@ -212,6 +291,7 @@ snd remove <alias>     # alias: snd rm
 
 # List configured servers and groups
 snd list               # alias: snd ls
+# (with a target, `snd ls <server>` lists that server's remote dir — see above)
 ```
 
 ### Manage paths
@@ -242,6 +322,48 @@ prod
     web
     api:logs
 ```
+
+### Wildcard paths
+
+A remote path can contain a shell glob (`*`, `?`, `[...]`). Before running,
+`snd` SSHes to the server and expands the pattern to the directories that
+actually exist, then fans the operation out to every match. This is built for
+setups where the live directory carries an ID suffix that changes on every
+restart:
+
+```
+/srv/app/instances/          # live dirs, ID changes each start
+  app-1_a1b2c3d4/  app-2_e5f6a7b8/  app-3_9c8d7e6f/  app-4_0f1e2d3c/  ...
+```
+
+Point one path at the whole set with a glob and let `snd` work out the current
+IDs:
+
+```bash
+snd add-path app node '/srv/app/instances/app-*_*/plugins'
+
+snd app node build.jar
+# [app] /srv/app/instances/app-*_*/plugins — resolved to 4 path(s) on deploy@10.0.0.1:
+#     /srv/app/instances/app-1_a1b2c3d4/plugins
+#     /srv/app/instances/app-2_e5f6a7b8/plugins
+#     /srv/app/instances/app-3_9c8d7e6f/plugins
+#     /srv/app/instances/app-4_0f1e2d3c/plugins
+# Send to all 4 resolved path(s)? [y/N] y
+```
+
+Notes:
+
+- Quote the pattern when adding it (`'...*...'`) so your local shell doesn't
+  expand it — you want the `*` stored in the config and expanded on the remote.
+- A single glob path already fans out to every match, so you usually don't need
+  a group for "all the instance folders". Groups still compose with globs if
+  you want to mix in other servers.
+- Only directories that exist are matched. A pattern that matches nothing is an
+  error (nothing is sent), so a typo can't silently no-op.
+- The fan-out is confirmed before a `send` (skip with `-f`). `get`, `delete`,
+  and `find` expand the same way; `get` drops each match's files into a
+  per-match subdirectory so they don't collide.
+- Works via `-p` too: `snd -p '/srv/app/instances/app-*_*/plugins' app build.jar`.
 
 ## Shell Completions
 

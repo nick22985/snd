@@ -2,8 +2,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use clap_complete::Shell;
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 
 use crate::config::{load_config, load_servers};
 use crate::ssh::parse_ssh_hosts;
@@ -277,7 +277,9 @@ fn extract_server_arg() -> Option<String> {
     let words = subcommand_words();
     for (i, w) in words.iter().enumerate() {
         match w.as_str() {
-            "remove-path" | "rm-path" | "set-default" | "edit-path" if i + 1 < words.len() => {
+            "remove-path" | "rm-path" | "set-default" | "edit-path" | "list" | "ls"
+                if i + 1 < words.len() =>
+            {
                 return Some(words[i + 1].clone());
             }
             _ => {}
@@ -365,6 +367,7 @@ fn extract_main_server_arg() -> Option<String> {
         "set-default",
         "list",
         "ls",
+        "cat",
         "completions",
         "help",
         "delete",
@@ -373,6 +376,8 @@ fn extract_main_server_arg() -> Option<String> {
         "get",
         "pull",
         "fetch",
+        "find",
+        "search",
         "add-group",
         "remove-group",
         "rm-group",
@@ -618,13 +623,16 @@ fn remote_target_token() -> Option<String> {
     let start = words.iter().position(|w| {
         matches!(
             w.as_str(),
-            "get" | "pull" | "fetch" | "delete" | "del" | "rm-remote"
+            "get" | "pull" | "fetch" | "delete" | "del" | "rm-remote" | "find" | "search" | "cat"
         )
     })?;
     let mut i = start + 1;
     while i < words.len() {
         let w = &words[i];
-        if matches!(w.as_str(), "-o" | "--to" | "-p" | "--path") {
+        if matches!(
+            w.as_str(),
+            "-o" | "--to" | "-p" | "--path" | "-d" | "--depth"
+        ) {
             i += 2;
             continue;
         }
@@ -635,6 +643,50 @@ fn remote_target_token() -> Option<String> {
         return Some(w.clone());
     }
     None
+}
+
+fn find_target_token() -> Option<String> {
+    let words = subcommand_words();
+    let start = words
+        .iter()
+        .position(|w| matches!(w.as_str(), "find" | "search"))?;
+    let mut i = start + 1;
+    while i < words.len() {
+        let w = &words[i];
+        if matches!(w.as_str(), "-p" | "--path" | "-d" | "--depth") {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return Some(w.clone());
+    }
+    None
+}
+
+fn complete_find_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let current = current.to_str().unwrap_or("");
+    let Some(target) = find_target_token() else {
+        return Vec::new();
+    };
+    let servers = load_servers();
+    let Some(srv) = servers.get(&target) else {
+        return Vec::new();
+    };
+    srv.paths
+        .iter()
+        .filter(|(k, _)| current.is_empty() || fuzzy_match(current, k))
+        .map(|(k, v)| {
+            let help = if k == &srv.default {
+                format!("{v} (default)")
+            } else {
+                v.clone()
+            };
+            CompletionCandidate::new(k).help(Some(clap::builder::StyledStr::from(help)))
+        })
+        .collect()
 }
 
 fn resolve_target_host_base(token: &str) -> Option<(String, String)> {
@@ -755,7 +807,18 @@ pub enum Cmd {
         path_alias: String,
     },
     #[command(alias = "ls")]
-    List,
+    List {
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: Option<String>,
+        #[arg(value_name = "PATH_ALIAS", add = ArgValueCompleter::new(complete_path_alias))]
+        path_alias: Option<String>,
+    },
+    Cat {
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
+        files: Vec<String>,
+    },
     #[command(alias = "pull", alias = "fetch")]
     Get {
         #[arg(short = 'r', long)]
@@ -775,6 +838,21 @@ pub enum Cmd {
         target: String,
         #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
         files: Vec<String>,
+    },
+    #[command(alias = "search")]
+    Find {
+        #[arg(short = 'g', long)]
+        grep: bool,
+        #[arg(short = 'e', long)]
+        regex: bool,
+        #[arg(long = "case-sensitive")]
+        case_sensitive: bool,
+        #[arg(short = 'd', long = "depth", value_name = "N")]
+        depth: Option<u32>,
+        #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
+        target: String,
+        #[arg(value_name = "[PATH_ALIAS] PATTERN", trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_find_positional))]
+        rest: Vec<String>,
     },
     #[command(name = "add-group")]
     AddGroup {

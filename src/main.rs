@@ -9,7 +9,8 @@ use snd::config::{
     parse_group_target, save_config,
 };
 use snd::remote::{
-    RemoteFileInfo, confirm, destination_basename, format_size, join_remote, rm_remote, stat_remote,
+    RemoteFileInfo, cat_remote, confirm, destination_basename, expand_remote_glob, find_remote,
+    format_size, glob_label, grep_remote, has_glob, join_remote, ls_remote, rm_remote, stat_remote,
 };
 
 fn load_or_exit() -> Config {
@@ -340,6 +341,158 @@ fn dispatch_delete(recursive: bool, targets: Vec<ResolvedTarget>, files: Vec<Str
     worst
 }
 
+const MAX_FIND_LISTED: usize = 200;
+
+fn dispatch_find(
+    grep: bool,
+    regex: bool,
+    case_sensitive: bool,
+    depth: Option<u32>,
+    targets: Vec<ResolvedTarget>,
+    pattern: &str,
+) -> i32 {
+    let mut worst = 0;
+    for target in &targets {
+        if grep {
+            match grep_remote(&target.host, &target.path, pattern, regex, case_sensitive) {
+                Ok(lines) => {
+                    println!("[{}] {}:{}", target.server_name, target.host, target.path);
+                    if lines.is_empty() {
+                        println!("  no matches");
+                    } else {
+                        for line in &lines {
+                            println!("  {line}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[{}] search failed: {e}", target.server_name);
+                    worst = 1;
+                }
+            }
+            continue;
+        }
+
+        match find_remote(
+            &target.host,
+            &target.path,
+            pattern,
+            regex,
+            case_sensitive,
+            depth,
+        ) {
+            Ok(paths) => {
+                if paths.is_empty() {
+                    println!(
+                        "[{}] {}:{} — no matches",
+                        target.server_name, target.host, target.path
+                    );
+                    continue;
+                }
+                let total = paths.len();
+                let shown = &paths[..total.min(MAX_FIND_LISTED)];
+                let truncated = if total > shown.len() {
+                    format!(" (showing {})", shown.len())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "[{}] {}:{} — {total} match(es){truncated}:",
+                    target.server_name, target.host, target.path
+                );
+                match stat_remote(&target.host, shown) {
+                    Ok(infos) if !infos.is_empty() => {
+                        for info in &infos {
+                            let kind = if info.is_dir { " (dir)" } else { "" };
+                            println!(
+                                "  {:<40}  {:>10}  {}{}",
+                                info.path,
+                                format_size(info.size),
+                                info.mtime,
+                                kind
+                            );
+                        }
+                    }
+                    _ => {
+                        for p in shown {
+                            println!("  {p}");
+                        }
+                    }
+                }
+                if total > shown.len() {
+                    println!(
+                        "  … {} more (narrow with a path-alias, -p, or --depth)",
+                        total - shown.len()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("[{}] search failed: {e}", target.server_name);
+                worst = 1;
+            }
+        }
+    }
+    worst
+}
+
+fn dispatch_ls(targets: Vec<ResolvedTarget>) -> i32 {
+    let multi = targets.len() > 1;
+    let mut worst = 0;
+    for target in &targets {
+        if multi {
+            println!("[{}] {}:{}", target.server_name, target.host, target.path);
+        }
+        match ls_remote(&target.host, &target.path) {
+            Ok(status) => {
+                let code = status.code().unwrap_or(1);
+                if code != 0 && code > worst {
+                    worst = code;
+                }
+            }
+            Err(e) => {
+                eprintln!("[{}] ls failed: {e}", target.server_name);
+                worst = 1;
+            }
+        }
+        if multi {
+            println!();
+        }
+    }
+    worst
+}
+
+fn dispatch_cat(targets: Vec<ResolvedTarget>, files: Vec<String>) -> i32 {
+    let remote_files: Vec<&String> = files.iter().filter(|f| !f.starts_with('-')).collect();
+    if remote_files.is_empty() {
+        eprintln!("No files specified.");
+        return 1;
+    }
+    let multi = targets.len() > 1;
+    let mut worst = 0;
+    for target in &targets {
+        let paths: Vec<String> = remote_files
+            .iter()
+            .map(|f| resolve_remote_arg(&target.path, f))
+            .collect();
+        if multi {
+            println!("[{}] {}:{}", target.server_name, target.host, target.path);
+        }
+        match cat_remote(&target.host, &paths) {
+            Ok(status) => {
+                let code = status.code().unwrap_or(1);
+                if code != 0 && code > worst {
+                    worst = code;
+                }
+            }
+            Err(e) => {
+                eprintln!("[{}] cat failed: {e}", target.server_name);
+                worst = 1;
+            }
+        }
+    }
+    worst
+}
+
 fn main() {
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
@@ -491,7 +644,30 @@ fn main() {
             save_config(&cfg).expect("Failed to write config");
             println!("Default path for {server}: {path_alias}");
         }
-        Some(Cmd::List) => {
+        Some(Cmd::List {
+            target: Some(name),
+            path_alias,
+        }) => {
+            let cfg = load_config();
+            let mut rest: Vec<String> = path_alias.into_iter().collect();
+            let accept_alias = cli.path.is_none();
+            let mut resolved = resolve_target_set(&cfg, &name, &mut rest, accept_alias)
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    eprintln!("Run 'snd list' to see configured entries.");
+                    std::process::exit(1);
+                });
+            if let Some(extra) = rest.first() {
+                eprintln!("Unexpected argument '{extra}' after '{name}'.");
+                std::process::exit(1);
+            }
+            if let Some(p) = cli.path.as_deref() {
+                apply_path_override(&mut resolved, p);
+            }
+            let (resolved, _) = expand_or_exit(resolved);
+            std::process::exit(dispatch_ls(resolved));
+        }
+        Some(Cmd::List { target: None, .. }) => {
             let cfg = load_config();
             if cfg.servers.is_empty() && cfg.groups.is_empty() {
                 println!("No servers configured. Use 'snd add <alias> <host> [path]' to add one.");
@@ -633,6 +809,7 @@ fn main() {
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
+            let (resolved, _) = expand_or_exit(resolved);
             let code = dispatch_get(
                 cli.force,
                 cli.no_check,
@@ -657,8 +834,63 @@ fn main() {
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
+            let (resolved, _) = expand_or_exit(resolved);
             let code = dispatch_delete(recursive, resolved, files);
             std::process::exit(code);
+        }
+        Some(Cmd::Find {
+            grep,
+            regex,
+            case_sensitive,
+            depth,
+            target,
+            mut rest,
+        }) => {
+            let cfg = load_config();
+            let accept_alias = cli.path.is_none();
+            let mut resolved = resolve_target_set(&cfg, &target, &mut rest, accept_alias)
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    eprintln!("Run 'snd list' to see configured entries.");
+                    std::process::exit(1);
+                });
+            if let Some(p) = cli.path.as_deref() {
+                apply_path_override(&mut resolved, p);
+            }
+            let (resolved, _) = expand_or_exit(resolved);
+            let pattern = match rest.len() {
+                0 => {
+                    eprintln!(
+                        "No search pattern given.\nUsage: snd find [-g] [-e] {target} [path-alias] <pattern>"
+                    );
+                    std::process::exit(1);
+                }
+                1 => rest.remove(0),
+                _ => {
+                    eprintln!(
+                        "Expected a single search pattern, got {}: {rest:?}\nQuote it if it contains spaces.",
+                        rest.len()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let code = dispatch_find(grep, regex, case_sensitive, depth, resolved, &pattern);
+            std::process::exit(code);
+        }
+        Some(Cmd::Cat { target, mut files }) => {
+            let cfg = load_config();
+            let accept_alias = cli.path.is_none();
+            let mut resolved = resolve_target_set(&cfg, &target, &mut files, accept_alias)
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    eprintln!("Run 'snd list' to see configured entries.");
+                    std::process::exit(1);
+                });
+            if let Some(p) = cli.path.as_deref() {
+                apply_path_override(&mut resolved, p);
+            }
+            let (resolved, _) = expand_or_exit(resolved);
+            std::process::exit(dispatch_cat(resolved, files));
         }
         Some(Cmd::Doctor) => {
             let cfg = load_or_exit();
@@ -765,12 +997,68 @@ fn main() {
                 std::process::exit(1);
             }
 
+            let (targets, globbed) = expand_or_exit(targets);
+            if globbed
+                && !cli.force
+                && !confirm(&format!("Send to all {} resolved path(s)?", targets.len()))
+            {
+                eprintln!("Aborted.");
+                std::process::exit(1);
+            }
+
             expand_tildes(&mut args);
 
             let code = dispatch_send(cli.force, cli.no_check, targets, args);
             std::process::exit(code);
         }
     }
+}
+
+fn expand_target_globs(
+    targets: Vec<ResolvedTarget>,
+) -> Result<(Vec<ResolvedTarget>, bool), String> {
+    let mut out = Vec::new();
+    let mut expanded_any = false;
+    for t in targets {
+        if !has_glob(&t.path) {
+            out.push(t);
+            continue;
+        }
+        expanded_any = true;
+        let matches = expand_remote_glob(&t.host, &t.path)?;
+        if matches.is_empty() {
+            return Err(format!(
+                "[{}] pattern '{}' matched no directories on {}",
+                t.server_name, t.path, t.host
+            ));
+        }
+        eprintln!(
+            "[{}] {} — resolved to {} path(s) on {}:",
+            t.server_name,
+            t.path,
+            matches.len(),
+            t.host
+        );
+        for m in &matches {
+            eprintln!("    {m}");
+        }
+        for m in matches {
+            let label = glob_label(&t.path, &m);
+            out.push(ResolvedTarget {
+                server_name: format!("{}/{label}", t.server_name),
+                host: t.host.clone(),
+                path: m,
+            });
+        }
+    }
+    Ok((out, expanded_any))
+}
+
+fn expand_or_exit(targets: Vec<ResolvedTarget>) -> (Vec<ResolvedTarget>, bool) {
+    expand_target_globs(targets).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    })
 }
 
 /// Replace every target's path with the override.
