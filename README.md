@@ -44,17 +44,20 @@ snd web logs server.log         # uses the "logs" path-alias on web
 
 If the first positional matches a path-alias on the chosen server, that path is used instead of the server's default. Otherwise everything is treated as a file.
 
-#### One-off path override
+#### One-off remote directory
 
-Need a path that isn't worth saving as an alias? Pass `-p` / `--path`:
+Need a path that isn't worth saving as an alias? Put it after the target:
 
 ```bash
-snd -p /tmp/release web build.tar.gz
-snd --path '~/inbox' staging notes.md      # quote to keep ~ literal for the remote
-snd -p /opt/drop prod build.jar            # group: every member uses /opt/drop
+snd web /tmp/release/ build.tar.gz
+snd staging '~/inbox/' notes.md       # quote to keep ~ literal for the remote
+snd prod /opt/drop/ build.jar         # group: every member uses /opt/drop
 ```
 
-`-p` overrides whatever the server (or each group member) would otherwise resolve to. When it's set, the first positional is *not* parsed as a path-alias — it's just a file. Works for `snd delete` too.
+The same positional directory works with `ls`, `cat`, `get`/`pull`/`fetch`,
+`delete`, and `find`. A trailing `/` makes the directory unambiguous beside file
+arguments and is added automatically by completion. `-p` / `--path` remains
+available for compatibility and for ambiguous cases such as a bare one-off path.
 
 ##### Relative overrides (`./` and `../`)
 
@@ -62,16 +65,18 @@ Prefix the override with `./` or `../` to resolve it relative to the resolved se
 
 ```bash
 # web's default path is /var/www
-snd -p ./build web app.jar          # → u@h:/var/www/build
-snd -p ./logs/today web error.log   # → u@h:/var/www/logs/today
-snd -p ../shared web release.tar    # → u@h:/var/www/../shared (remote resolves)
+snd web ./build/ app.jar          # → u@h:/var/www/build
+snd web ./logs/today/ error.log   # → u@h:/var/www/logs/today
+snd web ../shared/ release.tar    # → u@h:/var/www/../shared (remote resolves)
 
 # Group "prod" with web=/var/www and api=/srv/api
-snd -p ./build prod app.jar
+snd prod ./build/ app.jar
 # → web sends to /var/www/build, api sends to /srv/api/build
 ```
 
-`-p ./` alone is a no-op (use the configured base unchanged). Anything that doesn't start with `./` or `../` is taken verbatim, so `-p /abs`, `-p ~/foo`, and `-p plainname` keep working as before.
+`./` and `../` directories resolve relative to each target's configured base.
+Anything else is used verbatim. For uploads, an existing local file still wins
+over positional-directory detection so multi-file sends keep working.
 
 ### Overwrite check
 
@@ -94,21 +99,22 @@ The stat call reuses your existing SSH multiplexing socket (`~/.ssh/snd-...`), s
 
 ### List a remote directory
 
-`snd ls <server>` runs `ls -lhA` on the server's configured path over SSH — handy
-for peeking at a folder (e.g. the current rotating instance dirs and their IDs)
-before you send. With no argument, `snd ls` still lists your configured servers
-and groups.
+`snd ls <server> [path]` runs `ls -lhA` over SSH — handy for peeking at a folder
+(e.g. the current rotating instance dirs and their IDs) before you send. Without
+a path it uses the server's configured default. With no server, `snd ls` still
+lists your configured servers and groups.
 
 ```bash
 snd ls                       # your servers + groups (same as `snd list`)
 snd ls app                   # ls the server's default path
 snd ls app logs              # ls a named path-alias
 snd ls app node              # a glob path lists each matching dir
-snd ls -p '/srv/app/instances' app   # one-off path
+snd ls app '/srv/app/instances'      # ls a one-off path
 ```
 
-A group lists every member, labelled per server. Glob paths and `-p` resolve the
-same way as everywhere else.
+A group lists every member, labelled per server. Bare paths resolve under each
+server's configured path; paths containing `/` and paths beginning with `~` are
+used verbatim. `-p` / `--path` remains available for compatibility.
 
 ### Print remote file contents
 
@@ -128,6 +134,13 @@ anything with `/` or `~` verbatim, `-p` overrides, globs expand). For a group,
 each server's output is printed under a `[server] host:path` header; a single
 server is a clean passthrough with no header.
 
+Output is colored automatically when stdout is a terminal. `snd ls` colors the
+long listing locally, while `find --grep` uses grep's standard color support.
+`snd cat` streams through a locally installed `bat` (or `batcat`) for syntax
+highlighting; the remote only needs standard `ls`, `grep`, and `cat`. If `bat`
+is unavailable, or output is piped/redirected, the content is passed through
+unchanged. Set `NO_COLOR=1` to disable color explicitly.
+
 ### Get files from a server
 
 ```bash
@@ -140,6 +153,9 @@ snd get web build.tar.gz
 # Pull from a named path-alias
 snd get web logs error.log
 
+# Pull from a one-off directory
+snd get web /var/log/nginx/ error.log
+
 # Absolute / `/`-containing / `~`-prefixed paths are taken as-is
 snd get web /etc/nginx/nginx.conf
 
@@ -150,7 +166,8 @@ snd get -o ./downloads web build.tar.gz
 snd get -r web stale-build
 ```
 
-Bare names resolve under the server's path; anything with `/` or `~` is used verbatim. `-p` / `--path` works the same as for `snd` and `snd delete`, including the `./` and `../` relative forms.
+Bare names resolve under the server's path; anything with `/` or `~` is used
+verbatim. A positional directory changes the base for the files that follow.
 
 When the target is a group, downloads land in `<dest>/<server-name>/` so files from each member don't collide:
 
@@ -189,12 +206,12 @@ $ snd find prod essentials
   /opt/app/backup/EssentialsX-old.jar          7.9 MB  2026-05-20 22:03:11 +0000
 ```
 
-The search base is the server's configured path — the same resolution as everything else, so a path-alias narrows it and `-p` overrides it:
+The search base is the server's configured path — the same resolution as everything else, so a path-alias or positional directory narrows it:
 
 ```bash
 snd find prod plugins essentials     # search under the 'plugins' path-alias
-snd find -p / prod worldedit         # sweep the whole server
-snd find -p ./logs prod error        # relative to the configured base
+snd find prod / worldedit            # sweep the whole server
+snd find prod ./logs/ error          # relative to the configured base
 ```
 
 Flags:
@@ -222,6 +239,9 @@ snd delete web build.tar.gz
 
 # Bare names → resolved under the server path. Anything with `/` or `~` → used as-is.
 snd delete web /tmp/dump.sql
+
+# Use a one-off directory as the base
+snd delete web /tmp/releases/ old-build.jar
 
 # Across an entire group
 snd delete prod build.tar.gz config.yml
@@ -372,7 +392,7 @@ Completions are dynamic and context-aware:
 - **Servers and groups** — `snd <TAB>` completes both, with a hint showing each entry's host or member count.
 - **Path aliases** — `snd web <TAB>` completes path-aliases configured on `web`.
 - **SSH hosts** — `snd add myserver <TAB>` fuzzy-matches hosts from `~/.ssh/config` (including `Include`d files), searchable by alias, hostname, IP, or user.
-- **Remote paths** — `snd add myserver host <TAB>` browses directories on the remote server via SSH.
+- **Remote paths and files** — `snd ls web <TAB>`, `snd cat web <TAB>`, `snd get web <TAB>`, and `snd delete web <TAB>` browse the configured remote path. Directories retain a trailing `/`, and selecting a path-alias changes the directory used by later completions.
 - **Group members** — `snd remove-from-group prod <TAB>` lists current members.
 - **Local files** — `snd prod <TAB>` completes local file paths.
 

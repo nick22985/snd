@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct RemoteFileInfo {
@@ -156,8 +156,17 @@ fn build_find_cmd(
     cmd
 }
 
-fn build_grep_cmd(base: &str, pattern: &str, regex: bool, case_sensitive: bool) -> String {
+fn build_grep_cmd(
+    base: &str,
+    pattern: &str,
+    regex: bool,
+    case_sensitive: bool,
+    color: bool,
+) -> String {
     let mut cmd = String::from("grep -rnI");
+    if color {
+        cmd.push_str(" --color=always");
+    }
     if !case_sensitive {
         cmd.push_str(" -i");
     }
@@ -205,8 +214,9 @@ pub fn grep_remote(
     pattern: &str,
     regex: bool,
     case_sensitive: bool,
+    color: bool,
 ) -> Result<Vec<String>, String> {
-    let cmd = build_grep_cmd(base, pattern, regex, case_sensitive);
+    let cmd = build_grep_cmd(base, pattern, regex, case_sensitive, color);
     let out = ssh_run(host, &cmd).map_err(|e| format!("ssh: {e}"))?;
     match out.status.code() {
         Some(0) => {}
@@ -326,15 +336,147 @@ pub fn rm_remote(
         .status()
 }
 
-pub fn cat_remote(host: &str, paths: &[String]) -> io::Result<std::process::ExitStatus> {
+fn build_cat_cmd(paths: &[String]) -> String {
     let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
-    let cmd = format!("cat -- {}", quoted.join(" "));
-    ssh_command(host, &cmd).status()
+    format!("cat -- {}", quoted.join(" "))
 }
 
-pub fn ls_remote(host: &str, path: &str) -> io::Result<std::process::ExitStatus> {
-    let cmd = format!("ls -lhA -- {}", shell_quote(path));
-    ssh_command(host, &cmd).status()
+fn local_highlighter() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in ["bat", "batcat"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let candidate = dir.join(format!("{name}.exe"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn cat_remote(
+    host: &str,
+    paths: &[String],
+    color: bool,
+) -> io::Result<std::process::ExitStatus> {
+    let cmd = build_cat_cmd(paths);
+    let Some(highlighter) = color.then(local_highlighter).flatten() else {
+        return ssh_command(host, &cmd).status();
+    };
+
+    let mut ssh = ssh_command(host, &cmd).stdout(Stdio::piped()).spawn()?;
+    let ssh_stdout = ssh
+        .stdout
+        .take()
+        .expect("ssh stdout is piped for local highlighting");
+    let mut bat = Command::new(highlighter);
+    bat.args(["--color=always", "--style=plain", "--paging=never"]);
+    if let Some(path) = paths.first() {
+        bat.arg("--file-name").arg(path);
+    }
+    let bat_status = bat.arg("-").stdin(ssh_stdout).status()?;
+    let ssh_status = ssh.wait()?;
+    if ssh_status.success() {
+        Ok(bat_status)
+    } else {
+        Ok(ssh_status)
+    }
+}
+
+fn build_ls_cmd(path: &str) -> String {
+    format!("ls -lhA -- {}", shell_quote(path))
+}
+
+fn colorize_ls_line(line: &str) -> String {
+    if line.starts_with("total ") {
+        return format!("\x1b[2m{line}\x1b[0m");
+    }
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, ch) in line.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(token_start) = start.take() {
+                spans.push((token_start, index));
+                if spans.len() == 9 {
+                    break;
+                }
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if spans.len() < 9
+        && let Some(token_start) = start
+    {
+        spans.push((token_start, line.len()));
+    }
+    if spans.len() < 9 {
+        return format!("\x1b[37m{line}\x1b[0m");
+    }
+
+    const FIELD_COLORS: [&str; 8] = ["36", "2", "33", "35", "32", "2", "2", "2"];
+    let mut out = String::with_capacity(line.len() + 100);
+    let mut cursor = 0;
+    for ((field_start, field_end), color) in spans.iter().take(8).zip(FIELD_COLORS) {
+        out.push_str(&line[cursor..*field_start]);
+        out.push_str("\x1b[");
+        out.push_str(color);
+        out.push('m');
+        out.push_str(&line[*field_start..*field_end]);
+        out.push_str("\x1b[0m");
+        cursor = *field_end;
+    }
+    let name_start = spans[8].0;
+    out.push_str(&line[cursor..name_start]);
+    let name_color = match line.as_bytes().first() {
+        Some(b'd') => "1;34",
+        Some(b'l') => "1;36",
+        _ if line
+            .as_bytes()
+            .get(1..10)
+            .is_some_and(|mode| mode.contains(&b'x')) =>
+        {
+            "1;32"
+        }
+        _ => "1;37",
+    };
+    out.push_str("\x1b[");
+    out.push_str(name_color);
+    out.push('m');
+    out.push_str(&line[name_start..]);
+    out.push_str("\x1b[0m");
+    out
+}
+
+fn colorize_ls_output(output: &str) -> String {
+    let mut colored = output
+        .lines()
+        .map(colorize_ls_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.ends_with('\n') {
+        colored.push('\n');
+    }
+    colored
+}
+
+pub fn ls_remote(host: &str, path: &str, color: bool) -> io::Result<std::process::ExitStatus> {
+    let cmd = build_ls_cmd(path);
+    if !color {
+        return ssh_command(host, &cmd).status();
+    }
+    let output = ssh_command(host, &cmd).output()?;
+    io::stdout()
+        .write_all(colorize_ls_output(&String::from_utf8_lossy(&output.stdout)).as_bytes())?;
+    io::stderr().write_all(&output.stderr)?;
+    Ok(output.status)
 }
 
 fn ssh_command(host: &str, remote_cmd: &str) -> Command {
@@ -488,7 +630,7 @@ mod tests {
     #[test]
     fn build_grep_cmd_default_fixed_case_insensitive() {
         assert_eq!(
-            build_grep_cmd("/opt/app", "db.host", false, false),
+            build_grep_cmd("/opt/app", "db.host", false, false, false),
             "grep -rnI -i -F -e db.host -- /opt/app"
         );
     }
@@ -496,7 +638,7 @@ mod tests {
     #[test]
     fn build_grep_cmd_regex_and_case_sensitive() {
         assert_eq!(
-            build_grep_cmd("/opt/app", "db\\.host", true, true),
+            build_grep_cmd("/opt/app", "db\\.host", true, true, false),
             "grep -rnI -E -e 'db\\.host' -- /opt/app"
         );
     }
@@ -542,8 +684,35 @@ mod tests {
     #[test]
     fn build_grep_cmd_quotes_dangerous_pattern() {
         assert_eq!(
-            build_grep_cmd("/opt/app", "a b; rm", false, false),
+            build_grep_cmd("/opt/app", "a b; rm", false, false, false),
             "grep -rnI -i -F -e 'a b; rm' -- /opt/app"
         );
+    }
+
+    #[test]
+    fn color_commands_force_ansi_only_when_requested() {
+        assert_eq!(
+            build_grep_cmd("/opt/app", "needle", false, false, true),
+            "grep -rnI --color=always -i -F -e needle -- /opt/app"
+        );
+        assert_eq!(build_ls_cmd("/opt/app"), "ls -lhA -- /opt/app");
+        assert_eq!(
+            build_cat_cmd(&["/opt/app/config.yml".to_string()]),
+            "cat -- /opt/app/config.yml"
+        );
+    }
+
+    #[test]
+    fn local_ls_colorizer_colors_every_filename_and_preserves_spaces() {
+        let input = concat!(
+            "total 8\n",
+            "-rw-r--r-- 1 deploy deploy 123 Jul 15 12:00 plain file.txt\n",
+            "drwxr-xr-x 2 deploy deploy 4.0K Jul 15 12:00 plugins\n"
+        );
+        let output = colorize_ls_output(input);
+        assert!(output.contains("\x1b[1;37mplain file.txt\x1b[0m"));
+        assert!(output.contains("\x1b[1;34mplugins\x1b[0m"));
+        assert!(output.contains("\x1b[33mdeploy\x1b[0m"));
+        assert!(output.ends_with('\n'));
     }
 }

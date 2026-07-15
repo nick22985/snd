@@ -2,8 +2,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use clap_complete::Shell;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
+use clap_complete::Shell;
 
 use crate::config::{load_config, load_servers};
 use crate::ssh::parse_ssh_hosts;
@@ -200,8 +200,12 @@ fn complete_path_alias(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let Some(server) = extract_server_arg() else {
         return Vec::new();
     };
+    path_alias_candidates(&server, current)
+}
+
+fn path_alias_candidates(server: &str, current: &str) -> Vec<CompletionCandidate> {
     let servers = load_servers();
-    let Some(srv) = servers.get(&server) else {
+    let Some(srv) = servers.get(server) else {
         return Vec::new();
     };
     srv.paths
@@ -216,6 +220,18 @@ fn complete_path_alias(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
             CompletionCandidate::new(k).help(Some(clap::builder::StyledStr::from(help)))
         })
         .collect()
+}
+
+fn complete_ls_path(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let mut out = complete_path_alias(current);
+    if let Some((host, base)) = extract_server_arg().and_then(|t| resolve_target_host_base(&t)) {
+        out.extend(remote_path_candidates(
+            &host,
+            Some(&base),
+            current.to_str().unwrap_or(""),
+        ));
+    }
+    out
 }
 
 fn complete_ssh_target(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -511,6 +527,9 @@ fn complete_main_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidat
                     CompletionCandidate::new(k).help(Some(clap::builder::StyledStr::from(help))),
                 );
             }
+            if let Some(base) = srv.default_path() {
+                candidates.extend(remote_directory_candidates(&srv.host, Some(base), partial));
+            }
         }
     }
 
@@ -596,13 +615,25 @@ fn remote_path_candidates(
             if !partial.is_empty() && !entry.starts_with(partial) {
                 return None;
             }
-            let full = format!("{prefix}{entry}");
+            let suffix = if is_dir { "/" } else { "" };
+            let full = format!("{prefix}{entry}{suffix}");
             let mut candidate = CompletionCandidate::new(&full);
             if is_dir {
                 candidate = candidate.help(Some(clap::builder::StyledStr::from("dir")));
             }
             Some(candidate)
         })
+        .collect()
+}
+
+fn remote_directory_candidates(
+    host: &str,
+    base: Option<&str>,
+    raw_current: &str,
+) -> Vec<CompletionCandidate> {
+    remote_path_candidates(host, base, raw_current)
+        .into_iter()
+        .filter(|candidate| candidate.get_value().to_string_lossy().ends_with('/'))
         .collect()
 }
 
@@ -645,6 +676,68 @@ fn remote_target_token() -> Option<String> {
     None
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RemoteFileCompletionContext {
+    target: String,
+    first_arg: Option<String>,
+    args_before_current: usize,
+    path_override: Option<String>,
+}
+
+fn remote_file_completion_context() -> Option<RemoteFileCompletionContext> {
+    remote_file_completion_context_from_words(&subcommand_words())
+}
+
+fn remote_file_completion_context_from_words(
+    words: &[String],
+) -> Option<RemoteFileCompletionContext> {
+    let start = words.iter().position(|w| {
+        matches!(
+            w.as_str(),
+            "get" | "pull" | "fetch" | "delete" | "del" | "rm-remote" | "cat"
+        )
+    })?;
+    let end = words.len().saturating_sub(1);
+    let mut positionals = Vec::new();
+    let mut path_override = None;
+    for (i, word) in words[..end].iter().enumerate() {
+        if matches!(word.as_str(), "-p" | "--path") && i + 1 < end {
+            path_override = Some(words[i + 1].replace("\\~", "~"));
+        } else if let Some(path) = word.strip_prefix("--path=") {
+            path_override = Some(path.replace("\\~", "~"));
+        }
+    }
+    let mut i = start + 1;
+    while i < end {
+        let w = &words[i];
+        if matches!(w.as_str(), "-p" | "--path") {
+            if i + 1 < end {
+                path_override = Some(words[i + 1].replace("\\~", "~"));
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(w.as_str(), "-o" | "--to") {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        positionals.push(w.clone());
+        i += 1;
+    }
+    let target = positionals.first()?.clone();
+    let args_before_current = positionals.len().saturating_sub(1);
+    Some(RemoteFileCompletionContext {
+        target,
+        first_arg: positionals.get(1).cloned(),
+        args_before_current,
+        path_override,
+    })
+}
+
 fn find_target_token() -> Option<String> {
     let words = subcommand_words();
     let start = words
@@ -666,6 +759,30 @@ fn find_target_token() -> Option<String> {
     None
 }
 
+fn find_args_before_current() -> Option<usize> {
+    let words = subcommand_words();
+    let start = words
+        .iter()
+        .position(|w| matches!(w.as_str(), "find" | "search"))?;
+    let end = words.len().saturating_sub(1);
+    let mut positionals = 0usize;
+    let mut i = start + 1;
+    while i < end {
+        let w = &words[i];
+        if matches!(w.as_str(), "-p" | "--path" | "-d" | "--depth") {
+            i += 2;
+            continue;
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        positionals += 1;
+        i += 1;
+    }
+    Some(positionals.saturating_sub(1))
+}
+
 fn complete_find_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     let current = current.to_str().unwrap_or("");
     let Some(target) = find_target_token() else {
@@ -675,7 +792,8 @@ fn complete_find_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidat
     let Some(srv) = servers.get(&target) else {
         return Vec::new();
     };
-    srv.paths
+    let mut out: Vec<CompletionCandidate> = srv
+        .paths
         .iter()
         .filter(|(k, _)| current.is_empty() || fuzzy_match(current, k))
         .map(|(k, v)| {
@@ -686,7 +804,13 @@ fn complete_find_positional(current: &std::ffi::OsStr) -> Vec<CompletionCandidat
             };
             CompletionCandidate::new(k).help(Some(clap::builder::StyledStr::from(help)))
         })
-        .collect()
+        .collect();
+    if find_args_before_current() == Some(0)
+        && let Some(base) = srv.default_path()
+    {
+        out.extend(remote_directory_candidates(&srv.host, Some(base), current));
+    }
+    out
 }
 
 fn resolve_target_host_base(token: &str) -> Option<(String, String)> {
@@ -706,12 +830,79 @@ fn resolve_target_host_base(token: &str) -> Option<(String, String)> {
 }
 
 fn complete_remote_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
-    let Some((host, base)) = remote_target_token().and_then(|t| resolve_target_host_base(&t))
-    else {
+    let Some(context) = remote_file_completion_context() else {
         return Vec::new();
     };
     let raw_current = current.to_str().unwrap_or("");
-    remote_path_candidates(&host, Some(&base), raw_current)
+    let cfg = load_config();
+    let Some(srv) = cfg.servers.get(&context.target) else {
+        let Some((host, base)) = resolve_target_host_base(&context.target) else {
+            return Vec::new();
+        };
+        let positional_override = context.first_arg.as_deref().filter(|path| {
+            context.path_override.is_none()
+                && context.args_before_current > 0
+                && positional_remote_path(path)
+        });
+        let base = context
+            .path_override
+            .as_deref()
+            .or(positional_override)
+            .map(|path| resolve_completion_override(&base, path))
+            .unwrap_or(base);
+        return remote_path_candidates(&host, Some(&base), raw_current);
+    };
+
+    let configured_base = context
+        .first_arg
+        .as_deref()
+        .filter(|_| context.path_override.is_none())
+        .and_then(|alias| srv.path_for(alias))
+        .or_else(|| srv.default_path());
+    let Some(configured_base) = configured_base else {
+        return Vec::new();
+    };
+    let positional_override = context.first_arg.as_deref().filter(|path| {
+        context.path_override.is_none()
+            && context.args_before_current > 0
+            && srv.path_for(path).is_none()
+            && positional_remote_path(path)
+    });
+    let base = context
+        .path_override
+        .as_deref()
+        .or(positional_override)
+        .map(|path| resolve_completion_override(configured_base, path))
+        .unwrap_or_else(|| configured_base.clone());
+    let mut out = Vec::new();
+    if context.args_before_current == 0 && context.path_override.is_none() {
+        out.extend(path_alias_candidates(&context.target, raw_current));
+    }
+    out.extend(remote_path_candidates(&srv.host, Some(&base), raw_current));
+    out
+}
+
+fn resolve_completion_override(base: &str, override_: &str) -> String {
+    if override_ == "." || override_ == "./" {
+        return base.to_string();
+    }
+    if let Some(rest) = override_.strip_prefix("./") {
+        return resolve_ls_dir(Some(base), rest);
+    }
+    if override_ == ".." || override_.starts_with("../") {
+        return format!("{}/{}", base.trim_end_matches('/'), override_);
+    }
+    override_.to_string()
+}
+
+fn positional_remote_path(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with('~')
+        || path == "."
+        || path.starts_with("./")
+        || path == ".."
+        || path.starts_with("../")
+        || path.ends_with('/')
 }
 
 fn complete_path_override(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
@@ -749,7 +940,7 @@ pub struct Cli {
     #[arg(add = ArgValueCompleter::new(complete_server_or_group))]
     pub server: Option<String>,
 
-    #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_main_positional))]
+    #[arg(value_name = "[PATH_ALIAS_OR_DIR] FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_main_positional))]
     pub args: Vec<String>,
 }
 
@@ -810,13 +1001,13 @@ pub enum Cmd {
     List {
         #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
         target: Option<String>,
-        #[arg(value_name = "PATH_ALIAS", add = ArgValueCompleter::new(complete_path_alias))]
-        path_alias: Option<String>,
+        #[arg(value_name = "PATH_ALIAS_OR_PATH", add = ArgValueCompleter::new(complete_ls_path))]
+        directory: Option<String>,
     },
     Cat {
         #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
         target: String,
-        #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
+        #[arg(value_name = "[PATH_ALIAS_OR_DIR] FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
         files: Vec<String>,
     },
     #[command(alias = "pull", alias = "fetch")]
@@ -827,7 +1018,7 @@ pub enum Cmd {
         to: Option<String>,
         #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
         target: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_remote_files))]
+        #[arg(value_name = "[PATH_ALIAS_OR_DIR] FILE", trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_remote_files))]
         files: Vec<String>,
     },
     #[command(alias = "del", alias = "rm-remote")]
@@ -836,7 +1027,7 @@ pub enum Cmd {
         recursive: bool,
         #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
         target: String,
-        #[arg(trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
+        #[arg(value_name = "[PATH_ALIAS_OR_DIR] FILE", trailing_var_arg = true, add = ArgValueCompleter::new(complete_remote_files))]
         files: Vec<String>,
     },
     #[command(alias = "search")]
@@ -851,7 +1042,7 @@ pub enum Cmd {
         depth: Option<u32>,
         #[arg(value_name = "SERVER_OR_GROUP", add = ArgValueCompleter::new(complete_server_or_group))]
         target: String,
-        #[arg(value_name = "[PATH_ALIAS] PATTERN", trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_find_positional))]
+        #[arg(value_name = "[PATH_ALIAS_OR_DIR] PATTERN", trailing_var_arg = true, allow_hyphen_values = true, add = ArgValueCompleter::new(complete_find_positional))]
         rest: Vec<String>,
     },
     #[command(name = "add-group")]
@@ -954,6 +1145,48 @@ mod tests {
     #[test]
     fn cache_key_handles_tilde_home() {
         assert_eq!(cache_key("host", "~"), "host-~");
+    }
+
+    #[test]
+    fn remote_file_context_tracks_selected_path_alias() {
+        let words = ["cat", "web", "logs", ""].map(String::from).to_vec();
+        assert_eq!(
+            remote_file_completion_context_from_words(&words),
+            Some(RemoteFileCompletionContext {
+                target: "web".to_string(),
+                first_arg: Some("logs".to_string()),
+                args_before_current: 1,
+                path_override: None,
+            })
+        );
+    }
+
+    #[test]
+    fn remote_file_context_skips_flags_and_tracks_path_override() {
+        let words = ["get", "-r", "-p", "./archive", "web", ""]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            remote_file_completion_context_from_words(&words),
+            Some(RemoteFileCompletionContext {
+                target: "web".to_string(),
+                first_arg: None,
+                args_before_current: 0,
+                path_override: Some("./archive".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn completion_override_resolves_relative_paths() {
+        assert_eq!(
+            resolve_completion_override("/srv/app", "./archive"),
+            "/srv/app/archive"
+        );
+        assert_eq!(
+            resolve_completion_override("/srv/app", "/var/log"),
+            "/var/log"
+        );
     }
 
     #[test]

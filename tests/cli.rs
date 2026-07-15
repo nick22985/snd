@@ -40,6 +40,7 @@ impl TestEnv {
         full.extend_from_slice(line);
         let output = Command::new(env!("CARGO_BIN_EXE_snd"))
             .env("XDG_CONFIG_HOME", &self.dir)
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("COMPLETE", "fish")
             .args(&full)
             .output()
@@ -52,6 +53,7 @@ impl TestEnv {
         full.extend_from_slice(line);
         let output = Command::new(env!("CARGO_BIN_EXE_snd"))
             .env("XDG_CONFIG_HOME", &self.dir)
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("HOME", home)
             .env("COMPLETE", "fish")
             .args(&full)
@@ -66,6 +68,7 @@ impl TestEnv {
         let output = Command::new(env!("CARGO_BIN_EXE_snd"))
             .current_dir(cwd)
             .env("XDG_CONFIG_HOME", &self.dir)
+            .env("XDG_CACHE_HOME", self.dir.join("cache"))
             .env("COMPLETE", "fish")
             .args(&full)
             .output()
@@ -75,6 +78,23 @@ impl TestEnv {
 
     fn config_file(&self) -> PathBuf {
         self.dir.join("snd").join("servers.toml")
+    }
+
+    fn seed_remote_completion(&self, host: &str, directory: &str, entries: &[&str]) {
+        let cache = self.dir.join("cache").join("snd");
+        std::fs::create_dir_all(&cache).unwrap();
+        let key = format!(
+            "{}-{}",
+            host.replace(['/', '@', ':'], "_"),
+            directory.replace('/', "_")
+        );
+        let mut contents = format!("{directory}\n");
+        for entry in entries {
+            contents.push_str(entry);
+            contents.push('\n');
+        }
+        std::fs::write(cache.join(&key), contents).unwrap();
+        std::fs::write(cache.join(format!("{key}.lock")), "").unwrap();
     }
 
     fn run_with_path(&self, extra_path: &std::path::Path, args: &[&str]) -> Output {
@@ -399,6 +419,61 @@ fn completion_path_alias_at_position_0() {
     assert!(out.contains("all"), "completion output: {out}");
     assert!(out.contains("logs"), "completion output: {out}");
     assert!(out.contains("default"), "completion output: {out}");
+}
+
+#[test]
+fn completion_remote_paths_for_ls_cat_get_and_delete() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/srv/app"]);
+    env.run(&["add-path", "web", "logs", "/var/log/app"]);
+    env.seed_remote_completion("u@h", "/srv/app", &["config.yml", "plugins/"]);
+
+    for command in ["ls", "cat", "get", "delete"] {
+        let out = env.run_complete(&[command, "web", ""]);
+        assert!(
+            out.contains("/srv/app/config.yml"),
+            "{command} should complete remote files: {out}"
+        );
+        assert!(
+            out.contains("/srv/app/plugins/"),
+            "{command} should preserve the directory slash: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|line| line == "logs" || line.starts_with("logs\t")),
+            "{command} should offer path aliases: {out}"
+        );
+    }
+
+    let out = env.run_complete(&["find", "web", ""]);
+    assert!(
+        out.contains("/srv/app/plugins/"),
+        "find should complete remote directories: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line == "logs" || line.starts_with("logs\t")),
+        "find should offer path aliases: {out}"
+    );
+}
+
+#[test]
+fn completion_remote_files_uses_selected_path_alias() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/srv/app"]);
+    env.run(&["add-path", "web", "logs", "/var/log/app"]);
+    env.seed_remote_completion("u@h", "/var/log/app", &["latest.log", "archive/"]);
+
+    let out = env.run_complete(&["cat", "web", "logs", ""]);
+    assert!(out.contains("/var/log/app/latest.log"), "completion: {out}");
+    assert!(out.contains("/var/log/app/archive/"), "completion: {out}");
+    assert!(!out.contains("/srv/app/"), "completion: {out}");
+
+    let out = env.run_complete(&["cat", "web", "/var/log/app", ""]);
+    assert!(
+        out.contains("/var/log/app/latest.log"),
+        "positional directory completion: {out}"
+    );
 }
 
 #[test]
@@ -835,6 +910,29 @@ fn delete_unknown_target_errors() {
     assert!(stderr(&out).contains("Unknown server or group"));
 }
 
+#[cfg(unix)]
+#[test]
+fn delete_accepts_a_positional_remote_directory() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("old-releases");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(remote.join("old.jar"), "old").unwrap();
+    env.run(&["add", "web", "u@h", "/unused"]);
+
+    let directory = format!("{}/", remote.display());
+    let out = env.run_with_path(&bin, &["delete", "web", &directory, "old.jar"]);
+    assert!(!out.status.success(), "confirmation should default to no");
+    assert!(
+        stdout(&out).contains(remote.join("old.jar").to_str().unwrap()),
+        "stdout: {}",
+        stdout(&out)
+    );
+    assert!(remote.join("old.jar").exists(), "delete should be aborted");
+}
+
 #[test]
 fn path_override_replaces_default_path() {
     let env = TestEnv::new();
@@ -1022,6 +1120,49 @@ fn get_passes_through_absolute_remote_path() {
 }
 
 #[test]
+fn get_accepts_a_positional_remote_directory() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let to = env.dir.join("dl");
+    let out = env.run(&[
+        "--no-check",
+        "get",
+        "--to",
+        to.to_str().unwrap(),
+        "web",
+        "/var/log/app/",
+        "latest.log",
+    ]);
+    assert!(
+        stdout(&out).contains("u@h:/var/log/app/latest.log"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn send_accepts_a_positional_remote_directory() {
+    let env = TestEnv::new();
+    env.run(&["add", "web", "u@h", "/var/www"]);
+    let out = env.run(&[
+        "--no-check",
+        "web",
+        "/srv/releases/",
+        "missing-local-file-xyz",
+    ]);
+    assert!(
+        stdout(&out).contains("u@h:/srv/releases/"),
+        "stdout: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("scp /srv/releases/"),
+        "the remote directory must not be passed to scp: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn get_with_recursive_flag_is_accepted() {
     let env = TestEnv::new();
     env.run(&["add", "web", "u@h", "/var/www"]);
@@ -1185,6 +1326,28 @@ fn find_consumes_path_alias_leaving_no_pattern_errors() {
         stderr(&out).contains("No search pattern"),
         "stderr: {}",
         stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_accepts_a_positional_remote_directory() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("search-here");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(remote.join("needle.txt"), "").unwrap();
+    env.run(&["add", "web", "u@h", "/unused"]);
+
+    let directory = format!("{}/", remote.display());
+    let out = env.run_with_path(&bin, &["find", "web", &directory, "needle"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("needle.txt"),
+        "stdout: {}",
+        stdout(&out)
     );
 }
 
@@ -1615,6 +1778,24 @@ fn cat_prints_remote_file_contents() {
 
 #[cfg(unix)]
 #[test]
+fn cat_accepts_a_positional_remote_directory() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let remote = env.dir.join("logs");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(remote.join("latest.log"), "ready\n").unwrap();
+    env.run(&["add", "proxy", "user@h", "/unused"]);
+
+    let directory = format!("{}/", remote.display());
+    let out = env.run_with_path(&bin, &["cat", "proxy", &directory, "latest.log"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("ready"), "stdout: {}", stdout(&out));
+}
+
+#[cfg(unix)]
+#[test]
 fn cat_no_files_errors() {
     let env = TestEnv::new();
     let bin = env.dir.join("fakebin");
@@ -1646,6 +1827,65 @@ fn ls_lists_remote_directory() {
     let so = stdout(&out);
     assert!(so.contains("app-1_a1b2c3d4"), "stdout: {so}");
     assert!(so.contains("app-2_e5f6a7b8"), "stdout: {so}");
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_accepts_path_as_a_positional_argument() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let default = env.dir.join("default");
+    let requested = env.dir.join("requested");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::create_dir_all(&requested).unwrap();
+    std::fs::create_dir_all(default.join("child")).unwrap();
+    std::fs::write(default.join("not-this-one.txt"), "").unwrap();
+    std::fs::write(default.join("child").join("relative-path.txt"), "").unwrap();
+    std::fs::write(requested.join("positional-path.txt"), "").unwrap();
+
+    env.run(&["add", "app", "user@h", default.to_str().unwrap()]);
+    let out = env.run_with_path(&bin, &["ls", "app", requested.to_str().unwrap()]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let so = stdout(&out);
+    assert!(so.contains("positional-path.txt"), "stdout: {so}");
+    assert!(!so.contains("not-this-one.txt"), "stdout: {so}");
+    assert!(!stderr(&out).contains("DEBUG"), "stderr: {}", stderr(&out));
+
+    let out = env.run_with_path(&bin, &["ls", "app", "child"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("relative-path.txt"),
+        "stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_positional_path_still_accepts_a_path_alias() {
+    let env = TestEnv::new();
+    let bin = env.dir.join("fakebin");
+    write_fake_ssh_tools(&bin);
+
+    let default = env.dir.join("default");
+    let logs = env.dir.join("logs");
+    std::fs::create_dir_all(&default).unwrap();
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("from-alias.log"), "").unwrap();
+
+    env.run(&["add", "app", "user@h", default.to_str().unwrap()]);
+    env.run(&["add-path", "app", "logs", logs.to_str().unwrap()]);
+    let out = env.run_with_path(&bin, &["ls", "app", "logs"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("from-alias.log"),
+        "stdout: {}",
+        stdout(&out)
+    );
 }
 
 #[test]

@@ -1,16 +1,17 @@
 use clap::{CommandFactory, Parser};
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::process::Command;
 
 use snd::cli::{Cli, Cmd};
 use snd::config::{
-    Config, Group, Server, SshResolved, canonicalize_group_target, load_config, load_config_strict,
-    parse_group_target, save_config,
+    canonicalize_group_target, load_config, load_config_strict, parse_group_target, save_config,
+    Config, Group, Server, SshResolved,
 };
 use snd::remote::{
-    RemoteFileInfo, cat_remote, confirm, destination_basename, expand_remote_glob, find_remote,
-    format_size, glob_label, grep_remote, has_glob, join_remote, ls_remote, rm_remote, stat_remote,
+    cat_remote, confirm, destination_basename, expand_remote_glob, find_remote, format_size,
+    glob_label, grep_remote, has_glob, join_remote, ls_remote, rm_remote, stat_remote,
+    RemoteFileInfo,
 };
 
 fn load_or_exit() -> Config {
@@ -18,6 +19,22 @@ fn load_or_exit() -> Config {
         eprintln!("Config error: {e}");
         std::process::exit(1);
     })
+}
+
+fn color_output_enabled() -> bool {
+    io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .map(|term| term != "dumb")
+            .unwrap_or(true)
+}
+
+fn colorize(text: &str, code: &str, enabled: bool) -> String {
+    if enabled {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -351,10 +368,18 @@ fn dispatch_find(
     targets: Vec<ResolvedTarget>,
     pattern: &str,
 ) -> i32 {
+    let color = color_output_enabled();
     let mut worst = 0;
     for target in &targets {
         if grep {
-            match grep_remote(&target.host, &target.path, pattern, regex, case_sensitive) {
+            match grep_remote(
+                &target.host,
+                &target.path,
+                pattern,
+                regex,
+                case_sensitive,
+                color,
+            ) {
                 Ok(lines) => {
                     println!("[{}] {}:{}", target.server_name, target.host, target.path);
                     if lines.is_empty() {
@@ -404,9 +429,10 @@ fn dispatch_find(
                     Ok(infos) if !infos.is_empty() => {
                         for info in &infos {
                             let kind = if info.is_dir { " (dir)" } else { "" };
+                            let path = format!("{:<40}", info.path);
                             println!(
-                                "  {:<40}  {:>10}  {}{}",
-                                info.path,
+                                "  {}  {:>10}  {}{}",
+                                colorize(&path, "36", color),
                                 format_size(info.size),
                                 info.mtime,
                                 kind
@@ -415,7 +441,7 @@ fn dispatch_find(
                     }
                     _ => {
                         for p in shown {
-                            println!("  {p}");
+                            println!("  {}", colorize(p, "36", color));
                         }
                     }
                 }
@@ -436,13 +462,14 @@ fn dispatch_find(
 }
 
 fn dispatch_ls(targets: Vec<ResolvedTarget>) -> i32 {
+    let color = color_output_enabled();
     let multi = targets.len() > 1;
     let mut worst = 0;
     for target in &targets {
         if multi {
             println!("[{}] {}:{}", target.server_name, target.host, target.path);
         }
-        match ls_remote(&target.host, &target.path) {
+        match ls_remote(&target.host, &target.path, color) {
             Ok(status) => {
                 let code = status.code().unwrap_or(1);
                 if code != 0 && code > worst {
@@ -462,6 +489,7 @@ fn dispatch_ls(targets: Vec<ResolvedTarget>) -> i32 {
 }
 
 fn dispatch_cat(targets: Vec<ResolvedTarget>, files: Vec<String>) -> i32 {
+    let color = color_output_enabled();
     let remote_files: Vec<&String> = files.iter().filter(|f| !f.starts_with('-')).collect();
     if remote_files.is_empty() {
         eprintln!("No files specified.");
@@ -477,7 +505,7 @@ fn dispatch_cat(targets: Vec<ResolvedTarget>, files: Vec<String>) -> i32 {
         if multi {
             println!("[{}] {}:{}", target.server_name, target.host, target.path);
         }
-        match cat_remote(&target.host, &paths) {
+        match cat_remote(&target.host, &paths, color) {
             Ok(status) => {
                 let code = status.code().unwrap_or(1);
                 if code != 0 && code > worst {
@@ -646,10 +674,10 @@ fn main() {
         }
         Some(Cmd::List {
             target: Some(name),
-            path_alias,
+            directory,
         }) => {
             let cfg = load_config();
-            let mut rest: Vec<String> = path_alias.into_iter().collect();
+            let mut rest: Vec<String> = directory.into_iter().collect();
             let accept_alias = cli.path.is_none();
             let mut resolved = resolve_target_set(&cfg, &name, &mut rest, accept_alias)
                 .unwrap_or_else(|e| {
@@ -657,9 +685,15 @@ fn main() {
                     eprintln!("Run 'snd list' to see configured entries.");
                     std::process::exit(1);
                 });
-            if let Some(extra) = rest.first() {
-                eprintln!("Unexpected argument '{extra}' after '{name}'.");
-                std::process::exit(1);
+            if let Some(arg) = rest.first() {
+                if cli.path.is_some() {
+                    eprintln!("Cannot combine a path argument with -p/--path.");
+                    std::process::exit(1);
+                }
+                let arg = arg.clone();
+                for t in resolved.iter_mut() {
+                    t.path = resolve_remote_arg(&t.path, &arg);
+                }
             }
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
@@ -806,6 +840,9 @@ fn main() {
                     eprintln!("{e}");
                     std::process::exit(1);
                 });
+            if cli.path.is_none() {
+                apply_positional_path_override(&mut resolved, &mut files, false);
+            }
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
@@ -823,14 +860,18 @@ fn main() {
         Some(Cmd::Delete {
             recursive,
             target,
-            files,
+            mut files,
         }) => {
             let cfg = load_config();
-            let mut resolved = resolve_target_set(&cfg, &target, &mut Vec::new(), false)
+            let accept_alias = cli.path.is_none();
+            let mut resolved = resolve_target_set(&cfg, &target, &mut files, accept_alias)
                 .unwrap_or_else(|e| {
                     eprintln!("{e}");
                     std::process::exit(1);
                 });
+            if cli.path.is_none() {
+                apply_positional_path_override(&mut resolved, &mut files, false);
+            }
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
@@ -854,6 +895,9 @@ fn main() {
                     eprintln!("Run 'snd list' to see configured entries.");
                     std::process::exit(1);
                 });
+            if cli.path.is_none() {
+                apply_positional_path_override(&mut resolved, &mut rest, false);
+            }
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
@@ -861,7 +905,7 @@ fn main() {
             let pattern = match rest.len() {
                 0 => {
                     eprintln!(
-                        "No search pattern given.\nUsage: snd find [-g] [-e] {target} [path-alias] <pattern>"
+                        "No search pattern given.\nUsage: snd find [-g] [-e] {target} [path-alias-or-dir] <pattern>"
                     );
                     std::process::exit(1);
                 }
@@ -886,6 +930,9 @@ fn main() {
                     eprintln!("Run 'snd list' to see configured entries.");
                     std::process::exit(1);
                 });
+            if cli.path.is_none() {
+                apply_positional_path_override(&mut resolved, &mut files, false);
+            }
             if let Some(p) = cli.path.as_deref() {
                 apply_path_override(&mut resolved, p);
             }
@@ -990,10 +1037,12 @@ fn main() {
 
             if let Some(p) = path_override {
                 apply_path_override(&mut targets, p);
+            } else {
+                apply_positional_path_override(&mut targets, &mut args, true);
             }
 
             if args.is_empty() {
-                eprintln!("No files specified.\nUsage: snd {name} [path-alias] <file...>");
+                eprintln!("No files specified.\nUsage: snd {name} [path-alias-or-dir] <file...>");
                 std::process::exit(1);
             }
 
@@ -1086,6 +1135,32 @@ fn resolve_path_override(base: &str, override_: &str) -> String {
         return join_remote(base, override_);
     }
     override_.to_string()
+}
+
+fn apply_positional_path_override(
+    targets: &mut [ResolvedTarget],
+    args: &mut Vec<String>,
+    local_files: bool,
+) -> bool {
+    if args.len() < 2 {
+        return false;
+    }
+    let first = &args[0];
+    let path_shaped = first.starts_with('/')
+        || first.starts_with('~')
+        || first == ".."
+        || first.starts_with("../")
+        || first.ends_with('/')
+        || (!local_files && (first == "." || first.starts_with("./")));
+    if !path_shaped {
+        return false;
+    }
+    if local_files && !first.ends_with('/') && std::path::Path::new(first).exists() {
+        return false;
+    }
+    let path = args.remove(0);
+    apply_path_override(targets, &path);
+    true
 }
 
 /// Resolve a server-or-group name. If `accept_path_alias_positional` is true
